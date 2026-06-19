@@ -1,4 +1,4 @@
-package com.example.notifydigest.ui.theme
+package com.bholeapps.notifydigest.ui.theme
 
 import android.app.Activity
 import android.os.Build

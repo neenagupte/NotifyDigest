@@ -4,11 +4,11 @@ plugins {
 }
 
 android {
-    namespace = "com.example.notifydigest"
+    namespace = "com.bholeapps.notifydigest"
     compileSdk = 37
 
     defaultConfig {
-        applicationId = "com.example.notifydigest"
+        applicationId = "com.bholeapps.notifydigest"
         minSdk = 24
         targetSdk = 36
         versionCode = 1

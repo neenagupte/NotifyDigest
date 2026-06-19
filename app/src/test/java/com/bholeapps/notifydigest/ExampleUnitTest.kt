@@ -1,4 +1,4 @@
-package com.example.notifydigest
+package com.bholeapps.notifydigest
 
 import org.junit.Test
 
