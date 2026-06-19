@@ -78,8 +78,10 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.layout.ContentScale
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.compose.ui.text.font.FontWeight
@@ -717,6 +719,18 @@ private fun HeroCard(
     onRefresh: () -> Unit,
     onClearTodayNoise: () -> Unit
 ) {
+    var showPermissionTooltip by remember(hasAccess) { mutableStateOf(!hasAccess) }
+
+    LaunchedEffect(hasAccess) {
+        if (!hasAccess) {
+            showPermissionTooltip = true
+            delay(5_000)
+            showPermissionTooltip = false
+        } else {
+            showPermissionTooltip = false
+        }
+    }
+
     val topAppLine = if (dailyStats.topAppName.isNotBlank()) {
         "${dailyStats.topAppName} is loudest today with ${dailyStats.topAppCount} alerts."
     } else {
@@ -736,7 +750,7 @@ private fun HeroCard(
         noiseScore >= 50 -> "Your phone is doing a lot of shouting today."
         else -> "Manageable chaos. We can work with this."
     }
-    Column(verticalArrangement = Arrangement.spacedBy(0.dp)) {
+    Box {
         Column(
             modifier = Modifier
                 .fillMaxWidth()
@@ -750,15 +764,7 @@ private fun HeroCard(
                 verticalAlignment = Alignment.Top,
                 horizontalArrangement = Arrangement.spacedBy(10.dp)
             ) {
-                Box(
-                    modifier = Modifier
-                        .size(48.dp)
-                        .clip(RoundedCornerShape(16.dp))
-                        .background(Brush.linearGradient(listOf(Orange, OrangeDeep))),
-                    contentAlignment = Alignment.Center
-                ) {
-                    MonsterEatingNotifications(modifier = Modifier.size(40.dp))
-                }
+                MonsterEatingNotifications(modifier = Modifier.size(48.dp))
                 Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
                     Text("Feed me notifications", color = Ink, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Black, maxLines = 2)
                     Text("Daily Notification Digest", color = Muted, style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.Bold, maxLines = 1)
@@ -789,8 +795,12 @@ private fun HeroCard(
                 SmallAction("Clear today's noise", Orange, onClearTodayNoise)
             }
         }
-        if (!hasAccess) {
-            PermissionTooltip()
+        if (!hasAccess && showPermissionTooltip) {
+            PermissionTooltip(
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .padding(top = 64.dp, end = 12.dp)
+            )
         }
     }
 }
@@ -827,16 +837,14 @@ private fun RefreshIconButton(onClick: () -> Unit) {
 }
 
 @Composable
-private fun PermissionTooltip() {
+private fun PermissionTooltip(modifier: Modifier = Modifier) {
     Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(end = 18.dp),
+        modifier = modifier.wrapContentSize(),
         horizontalAlignment = Alignment.End
     ) {
         Canvas(
             modifier = Modifier
-                .padding(end = 38.dp)
+                .padding(end = 34.dp)
                 .size(width = 18.dp, height = 8.dp)
         ) {
             val triangle = Path().apply {
@@ -857,7 +865,7 @@ private fun PermissionTooltip() {
         ) {
             Text("?", color = Orange, fontWeight = FontWeight.Black, style = MaterialTheme.typography.labelLarge)
             Text(
-                "Reads alerts locally. Nothing uploaded.",
+                "Tap Enable. Your digest stays on-device.",
                 color = Color.White,
                 style = MaterialTheme.typography.labelMedium,
                 fontWeight = FontWeight.Bold
@@ -1222,7 +1230,7 @@ private fun PrivacyCard() {
             .padding(16.dp)
     ) {
         Text("Private by design", color = Ink, fontWeight = FontWeight.Black, style = MaterialTheme.typography.titleMedium)
-        Text("MVP stores notification text locally on this phone. No cloud account, no server summary, no creepy forwarding.", color = Muted, style = MaterialTheme.typography.bodyMedium)
+        Text("Your notification digest stays on this phone. No account, no cloud upload, no selling your alerts.", color = Muted, style = MaterialTheme.typography.bodyMedium)
     }
 }
 
@@ -1237,76 +1245,34 @@ private fun BackgroundBlob() {
 @Composable
 private fun MonsterEatingNotifications(modifier: Modifier = Modifier) {
     val transition = rememberInfiniteTransition(label = "monster")
-    val bite by transition.animateFloat(
-        initialValue = 0f,
-        targetValue = 1f,
-        animationSpec = infiniteRepeatable(tween(1100, easing = FastOutSlowInEasing), RepeatMode.Reverse),
-        label = "bite"
+    val pulse by transition.animateFloat(
+        initialValue = 0.97f,
+        targetValue = 1.03f,
+        animationSpec = infiniteRepeatable(tween(1200, easing = FastOutSlowInEasing), RepeatMode.Reverse),
+        label = "monster-pulse"
     )
-    Canvas(modifier) {
-        val w = size.width
-        val h = size.height
-        val body = Rect(w * 0.16f, h * 0.18f, w * 0.88f, h * 0.88f)
-        drawOval(Color.White.copy(alpha = 0.96f), topLeft = body.topLeft, size = body.size)
-        drawOval(Color(0xFF14313A), topLeft = body.topLeft, size = body.size, style = Stroke(width = w * 0.045f))
-        drawCircle(Color.White, radius = w * 0.13f, center = Offset(w * 0.36f, h * 0.38f))
-        drawCircle(Color.White, radius = w * 0.13f, center = Offset(w * 0.66f, h * 0.38f))
-        drawCircle(Ink, radius = w * 0.055f, center = Offset(w * 0.38f, h * 0.40f))
-        drawCircle(Ink, radius = w * 0.055f, center = Offset(w * 0.64f, h * 0.40f))
-        val mouthTop = h * (0.55f - bite * 0.04f)
-        val mouthBottom = h * (0.72f + bite * 0.04f)
-        drawArc(Ink, startAngle = 0f, sweepAngle = 180f, useCenter = true, topLeft = Offset(w * 0.32f, mouthTop), size = Size(w * 0.42f, mouthBottom - mouthTop))
-        repeat(3) { index ->
-            val x = w * (0.34f + index * 0.12f)
-            val tooth = Path().apply {
-                moveTo(x, mouthTop + h * 0.03f)
-                lineTo(x + w * 0.05f, mouthTop + h * 0.03f)
-                lineTo(x + w * 0.025f, mouthTop + h * 0.12f)
-                close()
+    Image(
+        painter = painterResource(id = R.drawable.notifydigest_app_icon),
+        contentDescription = "NotifyDigest mascot",
+        modifier = modifier
+            .graphicsLayer {
+                scaleX = pulse
+                scaleY = pulse
             }
-            drawPath(tooth, Color.White)
-        }
-        drawRoundRect(Color.White, topLeft = Offset(w * (0.02f + bite * 0.08f), h * 0.52f), size = Size(w * 0.28f, h * 0.18f), cornerRadius = androidx.compose.ui.geometry.CornerRadius(16f, 16f))
-        drawLine(Orange, Offset(w * (0.08f + bite * 0.08f), h * 0.58f), Offset(w * (0.23f + bite * 0.08f), h * 0.58f), strokeWidth = w * 0.02f, cap = StrokeCap.Round)
-        drawLine(Orange, Offset(w * (0.08f + bite * 0.08f), h * 0.64f), Offset(w * (0.20f + bite * 0.08f), h * 0.64f), strokeWidth = w * 0.02f, cap = StrokeCap.Round)
-    }
+            .clip(RoundedCornerShape(24.dp)),
+        contentScale = ContentScale.Crop
+    )
 }
+
 
 @Composable
 private fun AppIconMark(modifier: Modifier = Modifier) {
-    Canvas(modifier.clip(RoundedCornerShape(16.dp)).background(Orange)) {
-        drawCircle(Color.White.copy(alpha = 0.16f), radius = size.minDimension * 0.36f, center = Offset(size.width * 0.82f, size.height * 0.18f))
-        drawCircle(Color.White.copy(alpha = 0.12f), radius = size.minDimension * 0.25f, center = Offset(size.width * 0.08f, size.height * 0.72f))
-        drawOval(
-            Color.White,
-            topLeft = Offset(size.width * 0.26f, size.height * 0.26f),
-            size = Size(size.width * 0.52f, size.height * 0.56f)
-        )
-        drawOval(
-            Color(0xFF17313A),
-            topLeft = Offset(size.width * 0.26f, size.height * 0.26f),
-            size = Size(size.width * 0.52f, size.height * 0.56f),
-            style = Stroke(width = size.minDimension * 0.045f)
-        )
-        drawCircle(Ink, radius = size.minDimension * 0.045f, center = Offset(size.width * 0.43f, size.height * 0.44f))
-        drawCircle(Ink, radius = size.minDimension * 0.045f, center = Offset(size.width * 0.61f, size.height * 0.44f))
-        drawArc(
-            Ink,
-            startAngle = 0f,
-            sweepAngle = 180f,
-            useCenter = true,
-            topLeft = Offset(size.width * 0.40f, size.height * 0.56f),
-            size = Size(size.width * 0.25f, size.height * 0.15f)
-        )
-        drawRoundRect(
-            Color.White,
-            topLeft = Offset(size.width * 0.07f, size.height * 0.50f),
-            size = Size(size.width * 0.27f, size.height * 0.20f),
-            cornerRadius = androidx.compose.ui.geometry.CornerRadius(7f, 7f)
-        )
-        drawLine(Orange, Offset(size.width * 0.12f, size.height * 0.57f), Offset(size.width * 0.28f, size.height * 0.57f), strokeWidth = size.minDimension * 0.025f, cap = StrokeCap.Round)
-        drawLine(Orange, Offset(size.width * 0.12f, size.height * 0.64f), Offset(size.width * 0.24f, size.height * 0.64f), strokeWidth = size.minDimension * 0.025f, cap = StrokeCap.Round)
-    }
+    Image(
+        painter = painterResource(id = R.drawable.notifydigest_app_icon),
+        contentDescription = "NotifyDigest",
+        modifier = modifier.clip(RoundedCornerShape(16.dp)),
+        contentScale = ContentScale.Crop
+    )
 }
 
 @Composable
