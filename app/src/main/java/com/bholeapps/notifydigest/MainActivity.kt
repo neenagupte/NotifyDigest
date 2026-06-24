@@ -93,6 +93,7 @@ import androidx.lifecycle.LifecycleEventObserver
 import org.json.JSONArray
 import org.json.JSONObject
 import kotlinx.coroutines.delay
+import org.tensorflow.lite.task.text.nlclassifier.NLClassifier
 import kotlin.math.abs
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -178,6 +179,7 @@ class DigestNotificationListener : NotificationListenerService() {
         }.getOrDefault(sbn.packageName)
 
         val notificationKey = sbn.key
+        val classification = DigestClassifier.classify(applicationContext, title, mergedText, label)
         val item = DigestItem(
             id = notificationKey.ifBlank { "${sbn.packageName}:${sbn.postTime}:${sbn.id}" },
             notificationKey = notificationKey,
@@ -186,11 +188,10 @@ class DigestNotificationListener : NotificationListenerService() {
             title = title.ifBlank { label },
             text = mergedText,
             timeMillis = sbn.postTime,
-            category = DigestClassifier.category(title, mergedText, label),
-            priority = DigestClassifier.priority(title, mergedText, label)
+            category = classification.category,
+            priority = classification.priority
         )
         NotificationStore.add(context = applicationContext, item = item)
-        DailyStatsStore.record(applicationContext, item)
         ListenerHealth.markCaptured(applicationContext, label)
     }
 }
@@ -207,28 +208,270 @@ data class DigestItem(
     val priority: String
 )
 
+data class DigestClassification(
+    val category: String,
+    val priority: String
+)
+
+data class TfliteClassificationSignal(
+    val category: String?,
+    val categoryScore: Float,
+    val priority: String?,
+    val priorityScore: Float
+)
+
 object DigestClassifier {
+    private val amountPattern = Regex("""(?:\u20B9|rs\.?|inr)\s?\d+|\b\d+(?:\.\d+)?\s?(?:rs|inr)\b""")
+    private val otpPattern = Regex("""\b(?:otp|one time password|verification code|security code)\b|\b\d{4,8}\b.*\b(?:otp|code|verification)\b|\b(?:otp|code|verification)\b.*\b\d{4,8}\b""")
+    private val timePattern = Regex("""\b(?:[01]?\d|2[0-3])(?::[0-5]\d)?\s?(?:am|pm)?\b""")
+    private val phonePattern = Regex("""\+?\d[\d -]{7,}\d""")
+
+    private val criticalTerms = listOf(
+        "otp", "one time password", "verification", "login", "password", "security",
+        "urgent", "fraud", "blocked", "suspicious", "unauthorized", "account locked",
+        "failed login", "verification code"
+    )
+    private val promoTerms = listOf(
+        "sale", "offer", "coupon", "deal", "discount", "cashback", "subscribe", "promo",
+        "shop now", "limited time", "ends tonight", "flat", "reward", "rewards",
+        "coins", "streak", "recommended", "trending", "watch now", "discover"
+    )
+
+    fun classify(title: String, text: String, app: String): DigestClassification {
+        val raw = normalizedInput(title, text, app)
+        val categoryScores = listOf(
+            CategoryScore("Calls", scoreCalls(raw)),
+            CategoryScore("Money", scoreMoney(raw)),
+            CategoryScore("Email", scoreEmail(raw)),
+            CategoryScore("Messages", scoreMessages(raw)),
+            CategoryScore("Orders", scoreOrders(raw)),
+            CategoryScore("Calendar", scoreCalendar(raw)),
+            CategoryScore("Noise", scoreNoise(raw)),
+            CategoryScore("System", scoreSystem(raw))
+        )
+        val best = categoryScores.maxByOrNull { it.score }
+        val category = if ((best?.score ?: 0) >= 2) best?.category ?: "Other" else "Other"
+
+        return DigestClassification(
+            category = category,
+            priority = semanticPriority(raw, category)
+        )
+    }
+
+    fun classify(context: Context, title: String, text: String, app: String): DigestClassification {
+        val raw = normalizedInput(title, text, app)
+        val semantic = classify(title, text, app)
+        val modelSignal = OnDeviceTextClassifier.classify(context.applicationContext, raw)
+        return mergeModelSignal(semantic, modelSignal)
+    }
+
     fun category(title: String, text: String, app: String): String {
-        val raw = "$title $text $app".lowercase()
-        return when {
-            listOf("missed call", "incoming call", "outgoing call", "phone call", "voice call", "video call", "call from", "called you", "voicemail", "phone", "dialer", "truecaller", "caller").any { it in raw } -> "Calls"
-            listOf("debited", "credited", "upi", "paid", "payment", "rs.", "inr", "bank", "spent", "refund", "wallet").any { it in raw } -> "Money"
-            listOf("gmail", "outlook", "yahoo mail", "email", "mail", "newsletter", "inbox").any { it in raw } -> "Email"
-            listOf("whatsapp", "telegram", "message", "chat", "instagram", "messenger", "sms").any { it in raw } -> "Messages"
-            listOf("delivered", "arriving", "order", "shipment", "delivery", "ride", "trip", "ticket", "zomato", "swiggy", "amazon", "flipkart", "uber", "ola").any { it in raw } -> "Orders"
-            listOf("calendar", "meeting", "reminder", "alarm", "event", "schedule").any { it in raw } -> "Calendar"
-            listOf("sale", "offer", "coupon", "deal", "discount", "cashback", "shop", "subscribe", "promo").any { it in raw } -> "Noise"
-            listOf("android system", "system ui", "battery", "storage", "download", "update", "backup", "permission", "wifi", "bluetooth").any { it in raw } -> "System"
-            else -> "Other"
-        }
+        return classify(title, text, app).category
     }
 
     fun priority(title: String, text: String, app: String): String {
-        val raw = "$title $text $app".lowercase()
+        return classify(title, text, app).priority
+    }
+
+    private fun semanticPriority(raw: String, category: String): String {
+        val criticalScore = scoreTerms(raw, criticalTerms) * 3 + if (otpPattern.containsMatchIn(raw)) 5 else 0
+        val noiseScore = scoreNoise(raw)
+        val transactionScore = scoreTerms(raw, listOf("debited", "credited", "paid", "received", "sent", "spent", "transaction", "txn", "upi", "bank", "card", "wallet")) +
+            if (amountPattern.containsMatchIn(raw)) 3 else 0
+        val timeBoundScore = scoreTerms(raw, listOf("today", "now", "soon", "starts", "starting", "reminder", "alarm", "meeting", "appointment", "deadline", "due"))
+
         return when {
-            listOf("missed call", "incoming call", "otp", "verification", "login", "password", "security", "urgent", "debited", "credited", "fraud", "blocked").any { it in raw } -> "Priority"
-            listOf("sale", "offer", "coupon", "deal", "discount", "cashback", "subscribe", "promo").any { it in raw } -> "Noise"
+            criticalScore >= 3 -> "Priority"
+            category == "Calls" && hasAny(raw, listOf("missed call", "incoming call", "voice call", "video call", "call from", "called you", "voicemail")) -> "Priority"
+            category == "Money" && transactionScore >= 4 && noiseScore < 4 -> "Priority"
+            category == "Calendar" && timeBoundScore >= 2 -> "Priority"
+            category == "Orders" && hasAny(raw, listOf("out for delivery", "arriving today", "arriving now", "delivered", "delayed", "cancelled", "boarding", "gate", "pickup", "ride arriving")) -> "Priority"
+            noiseScore >= 4 -> "Noise"
             else -> "Later"
+        }
+    }
+
+    private fun mergeModelSignal(
+        semantic: DigestClassification,
+        modelSignal: TfliteClassificationSignal?
+    ): DigestClassification {
+        if (modelSignal == null) return semantic
+
+        val category = if (modelSignal.category != null && modelSignal.categoryScore >= 0.75f) {
+            modelSignal.category
+        } else {
+            semantic.category
+        }
+        val priority = when {
+            semantic.priority == "Priority" -> "Priority"
+            modelSignal.priority != null && modelSignal.priorityScore >= 0.80f -> modelSignal.priority
+            else -> semantic.priority
+        }
+
+        return DigestClassification(category = category, priority = priority)
+    }
+
+    private fun normalizedInput(title: String, text: String, app: String): String {
+        return "$title $text $app".lowercase(Locale.getDefault()).replace(Regex("\\s+"), " ").trim()
+    }
+
+    private fun scoreCalls(raw: String): Int {
+        var score = scoreTerms(raw, listOf("missed call", "incoming call", "outgoing call", "phone call", "voice call", "video call", "call from", "called you", "voicemail")) * 3
+        score += scoreTerms(raw, listOf("dialer", "truecaller", "caller")) * 2
+        if (phonePattern.containsMatchIn(raw) && hasAny(raw, listOf("call", "missed", "caller"))) score += 2
+        return score
+    }
+
+    private fun scoreMoney(raw: String): Int {
+        var score = scoreTerms(raw, listOf("debited", "credited", "paid", "payment", "received", "sent", "spent", "refund", "transaction", "txn", "upi", "bank", "account", "card", "wallet", "balance")) * 2
+        if (amountPattern.containsMatchIn(raw)) score += 4
+        if (hasAny(raw, listOf("bill due", "invoice", "statement", "autopay", "mandate"))) score += 2
+        if (scoreNoise(raw) >= 5 && !amountPattern.containsMatchIn(raw)) score -= 2
+        return score.coerceAtLeast(0)
+    }
+
+    private fun scoreEmail(raw: String): Int {
+        var score = scoreTerms(raw, listOf("gmail", "outlook", "yahoo mail", "email", "e-mail", "mail", "inbox", "subject:", "from:")) * 2
+        if ("newsletter" in raw) score += 1
+        return score
+    }
+
+    private fun scoreMessages(raw: String): Int {
+        var score = scoreTerms(raw, listOf("whatsapp", "telegram", "messenger", "sms", "chat", "message", "new message", "sent you", "replied", "dm")) * 2
+        if (hasAny(raw, listOf("instagram", "signal", "messages"))) score += 2
+        return score
+    }
+
+    private fun scoreOrders(raw: String): Int {
+        return scoreTerms(
+            raw,
+            listOf(
+                "delivered", "arriving", "out for delivery", "order", "shipment", "delivery",
+                "ride", "trip", "ticket", "booking", "pnr", "boarding", "gate", "pickup",
+                "zomato", "swiggy", "amazon", "flipkart", "uber", "ola"
+            )
+        ) * 2
+    }
+
+    private fun scoreCalendar(raw: String): Int {
+        var score = scoreTerms(raw, listOf("calendar", "meeting", "reminder", "alarm", "event", "schedule", "appointment", "deadline", "due", "starts in")) * 2
+        if (timePattern.containsMatchIn(raw) && hasAny(raw, listOf("today", "tomorrow", "meeting", "reminder", "appointment", "event"))) score += 2
+        return score
+    }
+
+    private fun scoreNoise(raw: String): Int {
+        var score = scoreTerms(raw, promoTerms) * 2
+        if (hasAny(raw, listOf("newsletter", "marketing", "sponsored", "ad ", "ads ", "promotion"))) score += 2
+        return score
+    }
+
+    private fun scoreSystem(raw: String): Int {
+        return scoreTerms(
+            raw,
+            listOf(
+                "android system", "system ui", "battery", "storage", "download", "update",
+                "backup", "permission", "wifi", "bluetooth", "charging", "screenshot",
+                "sync", "usb", "do not disturb", "device care"
+            )
+        ) * 2
+    }
+
+    private fun scoreTerms(raw: String, terms: List<String>): Int {
+        return terms.count { it in raw }
+    }
+
+    private fun hasAny(raw: String, terms: List<String>): Boolean {
+        return terms.any { it in raw }
+    }
+
+    private data class CategoryScore(
+        val category: String,
+        val score: Int
+    )
+}
+
+object OnDeviceTextClassifier {
+    private const val MODEL_FILE = "text_classification_v2.tflite"
+    private val categoryLabels = mapOf(
+        "calls" to "Calls",
+        "call" to "Calls",
+        "money" to "Money",
+        "finance" to "Money",
+        "banking" to "Money",
+        "email" to "Email",
+        "mail" to "Email",
+        "messages" to "Messages",
+        "message" to "Messages",
+        "orders" to "Orders",
+        "order" to "Orders",
+        "calendar" to "Calendar",
+        "event" to "Calendar",
+        "noise" to "Noise",
+        "promotion" to "Noise",
+        "promo" to "Noise",
+        "system" to "System"
+    )
+    private val priorityLabels = mapOf(
+        "priority" to "Priority",
+        "important" to "Priority",
+        "urgent" to "Priority",
+        "noise" to "Noise",
+        "promotion" to "Noise",
+        "promo" to "Noise",
+        "normal" to "Later",
+        "later" to "Later"
+    )
+
+    @Volatile
+    private var classifier: NLClassifier? = null
+    @Volatile
+    private var supportsDigestLabels: Boolean? = null
+
+    fun classify(context: Context, raw: String): TfliteClassificationSignal? {
+        if (raw.isBlank()) return null
+        if (supportsDigestLabels == false) return null
+
+        return runCatching {
+            val categories = getClassifier(context).classify(raw)
+            var bestCategory: String? = null
+            var bestCategoryScore = 0f
+            var bestPriority: String? = null
+            var bestPriorityScore = 0f
+
+            categories.forEach { category ->
+                val label = category.label.trim().lowercase(Locale.getDefault())
+                val score = category.score
+                val mappedCategory = categoryLabels[label]
+                if (mappedCategory != null && score > bestCategoryScore) {
+                    bestCategory = mappedCategory
+                    bestCategoryScore = score
+                }
+                val mappedPriority = priorityLabels[label]
+                if (mappedPriority != null && score > bestPriorityScore) {
+                    bestPriority = mappedPriority
+                    bestPriorityScore = score
+                }
+            }
+
+            if (bestCategory == null && bestPriority == null) {
+                supportsDigestLabels = false
+                null
+            } else {
+                supportsDigestLabels = true
+                TfliteClassificationSignal(
+                    category = bestCategory,
+                    categoryScore = bestCategoryScore,
+                    priority = bestPriority,
+                    priorityScore = bestPriorityScore
+                )
+            }
+        }.getOrNull()
+    }
+
+    private fun getClassifier(context: Context): NLClassifier {
+        classifier?.let { return it }
+        return synchronized(this) {
+            classifier ?: NLClassifier.createFromFile(context, MODEL_FILE).also { classifier = it }
         }
     }
 }
@@ -243,86 +486,6 @@ data class DailyStats(
     val yesterdayTotalCount: Int,
     val yesterdayNoiseCount: Int
 )
-
-object DailyStatsStore {
-    private const val PREFS = "daily_notification_stats"
-    private const val KEY_DATE = "date"
-    private const val KEY_TOTAL = "total"
-    private const val KEY_PRIORITY = "priority"
-    private const val KEY_NOISE = "noise"
-    private const val KEY_APP_COUNTS = "app_counts"
-    private const val KEY_YESTERDAY_DATE = "yesterday_date"
-    private const val KEY_YESTERDAY_TOTAL = "yesterday_total"
-    private const val KEY_YESTERDAY_NOISE = "yesterday_noise"
-
-    fun record(context: Context, item: DigestItem) {
-        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-        val today = dayKey(item.timeMillis)
-        val storedDate = prefs.getString(KEY_DATE, "").orEmpty()
-        val sameDay = storedDate == today
-        val previousTotal = if (sameDay) prefs.getInt(KEY_TOTAL, 0) else 0
-        val previousPriority = if (sameDay) prefs.getInt(KEY_PRIORITY, 0) else 0
-        val previousNoise = if (sameDay) prefs.getInt(KEY_NOISE, 0) else 0
-        val appCounts = if (sameDay) readAppCounts(prefs.getString(KEY_APP_COUNTS, "{}").orEmpty()).toMutableMap() else mutableMapOf()
-        val editor = prefs.edit()
-        if (!sameDay && storedDate.isNotBlank()) {
-            editor
-                .putString(KEY_YESTERDAY_DATE, storedDate)
-                .putInt(KEY_YESTERDAY_TOTAL, prefs.getInt(KEY_TOTAL, 0))
-                .putInt(KEY_YESTERDAY_NOISE, prefs.getInt(KEY_NOISE, 0))
-        }
-        appCounts[item.appName] = (appCounts[item.appName] ?: 0) + 1
-        val priorityIncrement = if (item.priority == "Priority") 1 else 0
-        val noiseIncrement = if (isNoise(item)) 1 else 0
-        editor
-            .putString(KEY_DATE, today)
-            .putInt(KEY_TOTAL, previousTotal + 1)
-            .putInt(KEY_PRIORITY, previousPriority + priorityIncrement)
-            .putInt(KEY_NOISE, previousNoise + noiseIncrement)
-            .putString(KEY_APP_COUNTS, JSONObject(appCounts as Map<*, *>).toString())
-            .apply()
-    }
-
-    fun read(context: Context): DailyStats {
-        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-        val now = System.currentTimeMillis()
-        val today = dayKey(now)
-        val storedDate = prefs.getString(KEY_DATE, "").orEmpty()
-        val yesterday = dayKey(now - 24L * 60L * 60L * 1000L)
-        val yesterdayTotal = when {
-            storedDate == yesterday -> prefs.getInt(KEY_TOTAL, 0)
-            prefs.getString(KEY_YESTERDAY_DATE, "").orEmpty() == yesterday -> prefs.getInt(KEY_YESTERDAY_TOTAL, 0)
-            else -> 0
-        }
-        val yesterdayNoise = when {
-            storedDate == yesterday -> prefs.getInt(KEY_NOISE, 0)
-            prefs.getString(KEY_YESTERDAY_DATE, "").orEmpty() == yesterday -> prefs.getInt(KEY_YESTERDAY_NOISE, 0)
-            else -> 0
-        }
-        if (storedDate != today) {
-            return DailyStats(today, 0, 0, 0, "", 0, yesterdayTotal, yesterdayNoise)
-        }
-        val appCounts = readAppCounts(prefs.getString(KEY_APP_COUNTS, "{}").orEmpty())
-        val topApp = appCounts.maxByOrNull { it.value }
-        return DailyStats(
-            dateKey = today,
-            totalCount = prefs.getInt(KEY_TOTAL, 0),
-            priorityCount = prefs.getInt(KEY_PRIORITY, 0),
-            noiseCount = prefs.getInt(KEY_NOISE, 0),
-            topAppName = topApp?.key.orEmpty(),
-            topAppCount = topApp?.value ?: 0,
-            yesterdayTotalCount = yesterdayTotal,
-            yesterdayNoiseCount = yesterdayNoise
-        )
-    }
-
-    private fun readAppCounts(raw: String): Map<String, Int> {
-        return runCatching {
-            val json = JSONObject(raw)
-            json.keys().asSequence().associateWith { key -> json.optInt(key, 0) }
-        }.getOrDefault(emptyMap())
-    }
-}
 
 object NotificationStore {
     private const val PREFS = "notify_digest_store"
@@ -356,20 +519,20 @@ object NotificationStore {
             val array = JSONArray(raw)
             List(array.length()) { index ->
                 val item = array.getJSONObject(index)
+                val title = item.optString("title")
+                val text = item.optString("text")
+                val appName = item.optString("appName")
+                val classification = DigestClassifier.classify(context, title, text, appName)
                 DigestItem(
                     id = item.optString("id"),
                     notificationKey = item.optString("notificationKey", item.optString("id")),
-                    appName = item.optString("appName"),
+                    appName = appName,
                     packageName = item.optString("packageName"),
-                    title = item.optString("title"),
-                    text = item.optString("text"),
+                    title = title,
+                    text = text,
                     timeMillis = item.optLong("timeMillis"),
-                    category = DigestClassifier.category(
-                        item.optString("title"),
-                        item.optString("text"),
-                        item.optString("appName")
-                    ),
-                    priority = normalizePriority(item.optString("priority", "Later"))
+                    category = classification.category,
+                    priority = classification.priority
                 )
             }
         }.map { dedupe(it) }.getOrDefault(emptyList())
@@ -467,7 +630,7 @@ fun NotifyDigestApp() {
     var items by remember { mutableStateOf(loadInbox(context)) }
     var listenerStatus by remember { mutableStateOf(ListenerHealth.read(context)) }
     var selectedItem by remember { mutableStateOf<DigestItem?>(null) }
-    var dailyStats by remember { mutableStateOf(DailyStatsStore.read(context)) }
+    val dailyStats = remember(items) { buildDailyStats(items) }
 
     fun refreshPermissionState(showPromptWhenMissing: Boolean) {
         val enabled = hasNotificationAccess(context)
@@ -476,7 +639,6 @@ fun NotifyDigestApp() {
         if (enabled) requestListenerRebind(context)
         items = loadInbox(context)
         listenerStatus = ListenerHealth.read(context)
-        dailyStats = DailyStatsStore.read(context)
     }
 
     LaunchedEffect(Unit) {
@@ -489,7 +651,6 @@ fun NotifyDigestApp() {
             if (hasAccess) {
                 items = loadInbox(context)
                 listenerStatus = ListenerHealth.read(context)
-                dailyStats = DailyStatsStore.read(context)
             }
         }
     }
@@ -533,7 +694,6 @@ fun NotifyDigestApp() {
                             selectedItem = null
                             items = loadInbox(context)
                             listenerStatus = ListenerHealth.read(context)
-                                    dailyStats = DailyStatsStore.read(context)
                         }
                     )
                 }
@@ -562,15 +722,15 @@ fun NotifyDigestApp() {
                                 clearTodayNoiseNotifications(context, todayNoise)
                                 items = loadInbox(context)
                                 listenerStatus = ListenerHealth.read(context)
-                                dailyStats = DailyStatsStore.read(context)
                             }
                         )
                     }
-                    item { DigestStats(items, selected = filter, onPick = { filter = it }) }
+                    val filterScopedItems = filteredItems(items, filter)
                     item {
                         FilterRow(
                             selected = filter,
                             items = items,
+                            selectedPackage = appFilter,
                             onPick = { filter = it }
                         )
                     }
@@ -579,11 +739,12 @@ fun NotifyDigestApp() {
                             AppFilterRow(
                                 selectedPackage = appFilter,
                                 items = items,
+                                scopedItems = filterScopedItems,
                                 onPick = { appFilter = it }
                             )
                         }
                     }
-                    val visible = filteredByApp(filteredItems(items, filter), appFilter)
+                    val visible = filteredByApp(filterScopedItems, appFilter)
                     if (items.isNotEmpty()) {
                         item {
                             InboxActions(
@@ -594,13 +755,11 @@ fun NotifyDigestApp() {
                                     clearVisibleNotifications(context, visible)
                                     items = loadInbox(context)
                                     listenerStatus = ListenerHealth.read(context)
-                                    dailyStats = DailyStatsStore.read(context)
                                 },
                                 onClearAll = {
                                     clearAllNotifications(context, items)
                                     items = loadInbox(context)
                                     listenerStatus = ListenerHealth.read(context)
-                                    dailyStats = DailyStatsStore.read(context)
                                 }
                             )
                         }
@@ -617,7 +776,6 @@ fun NotifyDigestApp() {
                                     markNotificationDone(context, item)
                                     items = loadInbox(context)
                                     listenerStatus = ListenerHealth.read(context)
-                                    dailyStats = DailyStatsStore.read(context)
                                 }
                             )
                         }
@@ -887,33 +1045,6 @@ private fun CompactPill(label: String, color: Color) {
 }
 
 @Composable
-private fun DigestStats(items: List<DigestItem>, selected: String, onPick: (String) -> Unit) {
-    val cards = listOf(
-        Triple("Priority", items.count { it.priority == "Priority" }.toString(), Red),
-        Triple("Calls", items.count { it.category == "Calls" }.toString(), Blue),
-        Triple("Money", items.count { it.category == "Money" }.toString(), Green),
-        Triple("Noise", items.count { it.priority == "Noise" }.toString(), Orange)
-    )
-    Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
-        cards.forEach { (label, value, color) ->
-            val active = selected == label
-            Column(
-                modifier = Modifier
-                    .weight(1f)
-                    .clip(RoundedCornerShape(22.dp))
-                    .background(if (active) color.copy(alpha = 0.14f) else Color.White)
-                    .border(1.dp, if (active) color else Line, RoundedCornerShape(22.dp))
-                    .clickable { onPick(label) }
-                    .padding(12.dp)
-            ) {
-                Text(value, color = color, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Black)
-                Text(label, color = if (active) color else Muted, style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold, maxLines = 1)
-            }
-        }
-    }
-}
-
-@Composable
 private fun InboxActions(
     itemCount: Int,
     visibleCount: Int,
@@ -943,7 +1074,12 @@ private fun InboxActions(
 }
 
 @Composable
-private fun FilterRow(selected: String, items: List<DigestItem>, onPick: (String) -> Unit) {
+private fun FilterRow(
+    selected: String,
+    items: List<DigestItem>,
+    selectedPackage: String,
+    onPick: (String) -> Unit
+) {
     val filters = listOf("All", "Priority", "Calls", "Money", "Messages", "Email", "Orders", "Calendar", "Noise", "System")
     Row(
         modifier = Modifier
@@ -953,7 +1089,7 @@ private fun FilterRow(selected: String, items: List<DigestItem>, onPick: (String
     ) {
         filters.forEach { filter ->
             val active = selected == filter
-            val count = filteredItems(items, filter).size
+            val count = filteredByApp(filteredItems(items, filter), selectedPackage).size
             Box(
                 modifier = Modifier
                     .clip(RoundedCornerShape(999.dp))
@@ -969,12 +1105,30 @@ private fun FilterRow(selected: String, items: List<DigestItem>, onPick: (String
 }
 
 @Composable
-private fun AppFilterRow(selectedPackage: String, items: List<DigestItem>, onPick: (String) -> Unit) {
-    val appCounts = items
+private fun AppFilterRow(
+    selectedPackage: String,
+    items: List<DigestItem>,
+    scopedItems: List<DigestItem>,
+    onPick: (String) -> Unit
+) {
+    val appNames = items
+        .groupBy { it.packageName }
+        .mapValues { (_, appItems) -> appItems.first().appName }
+    val appCounts = scopedItems
         .groupBy { it.packageName }
         .map { (packageName, appItems) -> AppFilterOption(packageName, appItems.first().appName, appItems.size) }
         .sortedWith(compareByDescending<AppFilterOption> { it.count }.thenBy { it.appName.lowercase() })
-    val selectedLabel = appCounts.firstOrNull { it.packageName == selectedPackage }?.let { "${it.appName} ${it.count}" } ?: "All apps ${items.size}"
+    val selectedAppName = if (selectedPackage == ALL_APPS_FILTER) {
+        "All apps"
+    } else {
+        appNames[selectedPackage] ?: "Selected app"
+    }
+    val selectedCount = if (selectedPackage == ALL_APPS_FILTER) {
+        scopedItems.size
+    } else {
+        scopedItems.count { it.packageName == selectedPackage }
+    }
+    val selectedLabel = "$selectedAppName $selectedCount"
     var expanded by remember { mutableStateOf(false) }
     Box(
         modifier = Modifier
@@ -992,7 +1146,7 @@ private fun AppFilterRow(selectedPackage: String, items: List<DigestItem>, onPic
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(10.dp)
         ) {
-            SourceAppIcon(packageName = selectedPackage, appName = "All", modifier = Modifier.size(34.dp), accent = Orange)
+            SourceAppIcon(packageName = selectedPackage, appName = selectedAppName, modifier = Modifier.size(34.dp), accent = Orange)
             Column(Modifier.weight(1f)) {
                 Text("Filter by app", color = Muted, style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold)
                 Text(selectedLabel, color = Ink, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Black, maxLines = 1, overflow = TextOverflow.Ellipsis)
@@ -1001,7 +1155,7 @@ private fun AppFilterRow(selectedPackage: String, items: List<DigestItem>, onPic
         }
         DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
             DropdownMenuItem(
-                text = { Text("All apps ${items.size}", color = Ink, fontWeight = FontWeight.Bold) },
+                text = { Text("All apps ${scopedItems.size}", color = Ink, fontWeight = FontWeight.Bold) },
                 leadingIcon = { SourceAppIcon(packageName = ALL_APPS_FILTER, appName = "All", modifier = Modifier.size(28.dp), accent = Orange) },
                 onClick = {
                     onPick(ALL_APPS_FILTER)
@@ -1328,12 +1482,27 @@ private fun currentFilterLabel(filter: String, appFilter: String, items: List<Di
     return if (filter == "All") appLabel else "$filter / $appLabel"
 }
 
-private fun normalizePriority(priority: String): String {
-    return when (priority) {
-        "Important" -> "Priority"
-        "Noise" -> "Noise"
-        else -> "Later"
-    }
+private fun buildDailyStats(items: List<DigestItem>): DailyStats {
+    val now = System.currentTimeMillis()
+    val today = dayKey(now)
+    val yesterday = dayKey(now - 24L * 60L * 60L * 1000L)
+    val todayItems = items.filter { dayKey(it.timeMillis) == today }
+    val yesterdayItems = items.filter { dayKey(it.timeMillis) == yesterday }
+    val topApp = todayItems
+        .groupingBy { it.appName }
+        .eachCount()
+        .maxByOrNull { it.value }
+
+    return DailyStats(
+        dateKey = today,
+        totalCount = todayItems.size,
+        priorityCount = todayItems.count { it.priority == "Priority" },
+        noiseCount = todayItems.count { isNoise(it) },
+        topAppName = topApp?.key.orEmpty(),
+        topAppCount = topApp?.value ?: 0,
+        yesterdayTotalCount = yesterdayItems.size,
+        yesterdayNoiseCount = yesterdayItems.count { isNoise(it) }
+    )
 }
 
 private fun loadInbox(context: Context): List<DigestItem> {

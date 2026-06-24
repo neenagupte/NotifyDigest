@@ -1,0 +1,7 @@
+Model: TensorFlow Lite AverageWordVec text classifier sample
+Source: https://storage.googleapis.com/download.tensorflow.org/models/tflite/text_classification/text_classification_v2.tflite
+License: Apache License 2.0
+
+Note: This bundled sample model exposes sentiment labels only: Negative and Positive.
+NotifyDigest gates model output and only applies a TFLite result when a bundled model
+returns supported app labels such as Priority, Money, Orders, Calendar, Noise, or System.
