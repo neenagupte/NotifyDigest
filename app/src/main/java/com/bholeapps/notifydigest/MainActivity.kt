@@ -487,15 +487,55 @@ data class DailyStats(
     val yesterdayNoiseCount: Int
 )
 
+private data class PersistedDailyStats(
+    val dateKey: String,
+    val totalCount: Int,
+    val priorityCount: Int,
+    val noiseCount: Int,
+    val topAppName: String,
+    val topAppCount: Int,
+    val yesterdayTotalCount: Int,
+    val yesterdayNoiseCount: Int,
+    val appCounts: Map<String, Int>
+) {
+    companion object {
+        fun empty(dateKey: String) = PersistedDailyStats(
+            dateKey = dateKey,
+            totalCount = 0,
+            priorityCount = 0,
+            noiseCount = 0,
+            topAppName = "",
+            topAppCount = 0,
+            yesterdayTotalCount = 0,
+            yesterdayNoiseCount = 0,
+            appCounts = emptyMap()
+        )
+    }
+
+    fun toDailyStats() = DailyStats(
+        dateKey = dateKey,
+        totalCount = totalCount,
+        priorityCount = priorityCount,
+        noiseCount = noiseCount,
+        topAppName = topAppName,
+        topAppCount = topAppCount,
+        yesterdayTotalCount = yesterdayTotalCount,
+        yesterdayNoiseCount = yesterdayNoiseCount
+    )
+}
+
 object NotificationStore {
     private const val PREFS = "notify_digest_store"
     private const val KEY_ITEMS = "items"
+    private const val KEY_DAILY_STATS = "daily_stats"
     private const val MAX_ITEMS = 180
 
     fun add(context: Context, item: DigestItem) {
-        val items = read(context)
-            .filterNot { it.id == item.id || isSemanticDuplicate(it, item) }
-            .toMutableList()
+        val existingItems = read(context)
+        if (existingItems.any { it.id == item.id || isSemanticDuplicate(it, item) }) return
+
+        recordDailyStat(context, item)
+        val items = existingItems.toMutableList()
         items.add(0, item)
         write(context, dedupe(items).take(MAX_ITEMS))
     }
@@ -536,6 +576,114 @@ object NotificationStore {
                 )
             }
         }.map { dedupe(it) }.getOrDefault(emptyList())
+    }
+
+    fun readDailyStats(context: Context, visibleItems: List<DigestItem>): DailyStats {
+        val persisted = readPersistedDailyStats(context)
+        val visible = buildDailyStats(visibleItems)
+        return when {
+            visible.totalCount > persisted.totalCount -> {
+                val reconciled = persistedFromVisibleStats(visible, visibleItems)
+                writeDailyStats(context, reconciled)
+                reconciled.toDailyStats()
+            }
+            persisted.totalCount > 0 -> persisted.toDailyStats()
+            else -> visible
+        }
+    }
+
+    private fun recordDailyStat(context: Context, item: DigestItem) {
+        val stats = readPersistedDailyStats(context)
+        val itemDay = dayKey(item.timeMillis)
+        val today = dayKey(System.currentTimeMillis())
+        if (itemDay != today) return
+
+        val appCounts = stats.appCounts.toMutableMap()
+        appCounts[item.appName] = (appCounts[item.appName] ?: 0) + 1
+        val topApp = appCounts.maxByOrNull { it.value }
+        val isSameDay = stats.dateKey == today
+        val isPriority = item.priority == "Priority"
+        val isNoisy = isNoise(item)
+        val updated = PersistedDailyStats(
+            dateKey = today,
+            totalCount = if (isSameDay) stats.totalCount + 1 else 1,
+            priorityCount = if (isSameDay) stats.priorityCount + if (isPriority) 1 else 0 else if (isPriority) 1 else 0,
+            noiseCount = if (isSameDay) stats.noiseCount + if (isNoisy) 1 else 0 else if (isNoisy) 1 else 0,
+            topAppName = topApp?.key.orEmpty(),
+            topAppCount = topApp?.value ?: 0,
+            yesterdayTotalCount = if (stats.dateKey == today) stats.yesterdayTotalCount else stats.totalCount,
+            yesterdayNoiseCount = if (stats.dateKey == today) stats.yesterdayNoiseCount else stats.noiseCount,
+            appCounts = appCounts
+        )
+        writeDailyStats(context, updated)
+    }
+
+    private fun readPersistedDailyStats(context: Context): PersistedDailyStats {
+        val today = dayKey(System.currentTimeMillis())
+        val raw = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(KEY_DAILY_STATS, "").orEmpty()
+        val parsed = runCatching {
+            val json = JSONObject(raw)
+            val countsJson = json.optJSONObject("appCounts") ?: JSONObject()
+            val appCounts = mutableMapOf<String, Int>()
+            countsJson.keys().forEach { key -> appCounts[key] = countsJson.optInt(key) }
+            PersistedDailyStats(
+                dateKey = json.optString("dateKey"),
+                totalCount = json.optInt("totalCount"),
+                priorityCount = json.optInt("priorityCount"),
+                noiseCount = json.optInt("noiseCount"),
+                topAppName = json.optString("topAppName"),
+                topAppCount = json.optInt("topAppCount"),
+                yesterdayTotalCount = json.optInt("yesterdayTotalCount"),
+                yesterdayNoiseCount = json.optInt("yesterdayNoiseCount"),
+                appCounts = appCounts
+            )
+        }.getOrDefault(PersistedDailyStats.empty(today))
+
+        return if (parsed.dateKey == today) {
+            parsed
+        } else {
+            PersistedDailyStats.empty(today).copy(
+                yesterdayTotalCount = parsed.totalCount,
+                yesterdayNoiseCount = parsed.noiseCount
+            ).also { writeDailyStats(context, it) }
+        }
+    }
+
+    private fun writeDailyStats(context: Context, stats: PersistedDailyStats) {
+        val appCounts = JSONObject()
+        stats.appCounts.forEach { (appName, count) -> appCounts.put(appName, count) }
+        val json = JSONObject()
+            .put("dateKey", stats.dateKey)
+            .put("totalCount", stats.totalCount)
+            .put("priorityCount", stats.priorityCount)
+            .put("noiseCount", stats.noiseCount)
+            .put("topAppName", stats.topAppName)
+            .put("topAppCount", stats.topAppCount)
+            .put("yesterdayTotalCount", stats.yesterdayTotalCount)
+            .put("yesterdayNoiseCount", stats.yesterdayNoiseCount)
+            .put("appCounts", appCounts)
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .edit()
+            .putString(KEY_DAILY_STATS, json.toString())
+            .apply()
+    }
+
+    private fun persistedFromVisibleStats(stats: DailyStats, visibleItems: List<DigestItem>): PersistedDailyStats {
+        val appCounts = visibleItems
+            .filter { dayKey(it.timeMillis) == stats.dateKey }
+            .groupingBy { it.appName }
+            .eachCount()
+        return PersistedDailyStats(
+            dateKey = stats.dateKey,
+            totalCount = stats.totalCount,
+            priorityCount = stats.priorityCount,
+            noiseCount = stats.noiseCount,
+            topAppName = stats.topAppName,
+            topAppCount = stats.topAppCount,
+            yesterdayTotalCount = stats.yesterdayTotalCount,
+            yesterdayNoiseCount = stats.yesterdayNoiseCount,
+            appCounts = appCounts
+        )
     }
 
     private fun dedupe(items: List<DigestItem>): List<DigestItem> {
@@ -630,7 +778,7 @@ fun NotifyDigestApp() {
     var items by remember { mutableStateOf(loadInbox(context)) }
     var listenerStatus by remember { mutableStateOf(ListenerHealth.read(context)) }
     var selectedItem by remember { mutableStateOf<DigestItem?>(null) }
-    val dailyStats = remember(items) { buildDailyStats(items) }
+    var dailyStats by remember { mutableStateOf(NotificationStore.readDailyStats(context, items)) }
 
     fun refreshPermissionState(showPromptWhenMissing: Boolean) {
         val enabled = hasNotificationAccess(context)
@@ -638,6 +786,7 @@ fun NotifyDigestApp() {
         showPermissionDialog = showPromptWhenMissing && !enabled
         if (enabled) requestListenerRebind(context)
         items = loadInbox(context)
+        dailyStats = NotificationStore.readDailyStats(context, items)
         listenerStatus = ListenerHealth.read(context)
     }
 
@@ -650,6 +799,7 @@ fun NotifyDigestApp() {
             delay(2_000)
             if (hasAccess) {
                 items = loadInbox(context)
+                dailyStats = NotificationStore.readDailyStats(context, items)
                 listenerStatus = ListenerHealth.read(context)
             }
         }
@@ -693,6 +843,7 @@ fun NotifyDigestApp() {
                             markNotificationDone(context, item)
                             selectedItem = null
                             items = loadInbox(context)
+                            dailyStats = NotificationStore.readDailyStats(context, items)
                             listenerStatus = ListenerHealth.read(context)
                         }
                     )
@@ -721,6 +872,7 @@ fun NotifyDigestApp() {
                                 val todayNoise = items.filter { isToday(it.timeMillis) && isNoise(it) }
                                 clearTodayNoiseNotifications(context, todayNoise)
                                 items = loadInbox(context)
+                                dailyStats = NotificationStore.readDailyStats(context, items)
                                 listenerStatus = ListenerHealth.read(context)
                             }
                         )
@@ -754,11 +906,13 @@ fun NotifyDigestApp() {
                                 onClearVisible = {
                                     clearVisibleNotifications(context, visible)
                                     items = loadInbox(context)
+                                    dailyStats = NotificationStore.readDailyStats(context, items)
                                     listenerStatus = ListenerHealth.read(context)
                                 },
                                 onClearAll = {
                                     clearAllNotifications(context, items)
                                     items = loadInbox(context)
+                                    dailyStats = NotificationStore.readDailyStats(context, items)
                                     listenerStatus = ListenerHealth.read(context)
                                 }
                             )
@@ -775,6 +929,7 @@ fun NotifyDigestApp() {
                                 onDismiss = {
                                     markNotificationDone(context, item)
                                     items = loadInbox(context)
+                                    dailyStats = NotificationStore.readDailyStats(context, items)
                                     listenerStatus = ListenerHealth.read(context)
                                 }
                             )
