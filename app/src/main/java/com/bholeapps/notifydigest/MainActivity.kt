@@ -5,10 +5,14 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.drawable.BitmapDrawable
 import android.graphics.drawable.Drawable
+import android.graphics.drawable.Icon
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Parcelable
 import android.provider.Settings
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
@@ -17,6 +21,7 @@ import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
@@ -64,6 +69,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -80,9 +86,12 @@ import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.composed
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -94,10 +103,29 @@ import org.json.JSONArray
 import org.json.JSONObject
 import kotlinx.coroutines.delay
 import org.tensorflow.lite.task.text.nlclassifier.NLClassifier
+import java.io.File
+import java.io.FileOutputStream
 import kotlin.math.abs
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+
+private fun Modifier.hapticClick(onClick: () -> Unit): Modifier = composed {
+    val haptic = LocalHapticFeedback.current
+    clickable {
+        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+        onClick()
+    }
+}
+
+@Composable
+private fun hapticAction(onClick: () -> Unit): () -> Unit {
+    val haptic = LocalHapticFeedback.current
+    return {
+        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+        onClick()
+    }
+}
 
 private val Orange = Color(0xFFFC8019)
 private val OrangeDeep = Color(0xFFE95800)
@@ -160,10 +188,12 @@ class DigestNotificationListener : NotificationListenerService() {
         val textLines = extras.getCharSequenceArray(Notification.EXTRA_TEXT_LINES)
             ?.joinToString(" ") { it.toString() }
             .orEmpty()
+        val notificationLines = extractNotificationLines(sbn.notification)
         val mergedText = listOf(text, bigText, subText, summaryText, textLines)
             .filter { it.isNotBlank() }
             .distinct()
             .joinToString(" ")
+            .ifBlank { notificationLines.joinToString("\n") }
         if (title.isBlank() && mergedText.isBlank()) {
             ListenerHealth.markIgnored(applicationContext, sbn.packageName)
             return
@@ -179,9 +209,24 @@ class DigestNotificationListener : NotificationListenerService() {
         }.getOrDefault(sbn.packageName)
 
         val notificationKey = sbn.key
+        val itemId = notificationKey.ifBlank { "${sbn.packageName}:${sbn.postTime}:${sbn.id}" }
         val classification = DigestClassifier.classify(applicationContext, title, mergedText, label)
+        val notificationIconPath = saveNotificationBitmap(
+            context = applicationContext,
+            itemId = itemId,
+            kind = "icon",
+            bitmap = extractNotificationIconBitmap(applicationContext, sbn.notification),
+            maxDimension = 192
+        )
+        val contentImagePath = saveNotificationBitmap(
+            context = applicationContext,
+            itemId = itemId,
+            kind = "image",
+            bitmap = extractNotificationPictureBitmap(applicationContext, sbn.notification),
+            maxDimension = 720
+        )
         val item = DigestItem(
-            id = notificationKey.ifBlank { "${sbn.packageName}:${sbn.postTime}:${sbn.id}" },
+            id = itemId,
             notificationKey = notificationKey,
             appName = label,
             packageName = sbn.packageName,
@@ -189,7 +234,10 @@ class DigestNotificationListener : NotificationListenerService() {
             text = mergedText,
             timeMillis = sbn.postTime,
             category = classification.category,
-            priority = classification.priority
+            priority = classification.priority,
+            notificationIconPath = notificationIconPath.orEmpty(),
+            contentImagePath = contentImagePath.orEmpty(),
+            lines = notificationLines
         )
         NotificationStore.add(context = applicationContext, item = item)
         ListenerHealth.markCaptured(applicationContext, label)
@@ -205,7 +253,10 @@ data class DigestItem(
     val text: String,
     val timeMillis: Long,
     val category: String,
-    val priority: String
+    val priority: String,
+    val notificationIconPath: String = "",
+    val contentImagePath: String = "",
+    val lines: List<String> = emptyList()
 )
 
 data class DigestClassification(
@@ -484,7 +535,10 @@ data class DailyStats(
     val topAppName: String,
     val topAppCount: Int,
     val yesterdayTotalCount: Int,
-    val yesterdayNoiseCount: Int
+    val yesterdayNoiseCount: Int,
+    val appCounts: Map<String, Int>,
+    val priorityAppCounts: Map<String, Int>,
+    val noiseAppCounts: Map<String, Int>
 )
 
 private data class PersistedDailyStats(
@@ -496,7 +550,9 @@ private data class PersistedDailyStats(
     val topAppCount: Int,
     val yesterdayTotalCount: Int,
     val yesterdayNoiseCount: Int,
-    val appCounts: Map<String, Int>
+    val appCounts: Map<String, Int>,
+    val priorityAppCounts: Map<String, Int>,
+    val noiseAppCounts: Map<String, Int>
 ) {
     companion object {
         fun empty(dateKey: String) = PersistedDailyStats(
@@ -508,7 +564,9 @@ private data class PersistedDailyStats(
             topAppCount = 0,
             yesterdayTotalCount = 0,
             yesterdayNoiseCount = 0,
-            appCounts = emptyMap()
+            appCounts = emptyMap(),
+            priorityAppCounts = emptyMap(),
+            noiseAppCounts = emptyMap()
         )
     }
 
@@ -520,7 +578,10 @@ private data class PersistedDailyStats(
         topAppName = topAppName,
         topAppCount = topAppCount,
         yesterdayTotalCount = yesterdayTotalCount,
-        yesterdayNoiseCount = yesterdayNoiseCount
+        yesterdayNoiseCount = yesterdayNoiseCount,
+        appCounts = appCounts,
+        priorityAppCounts = priorityAppCounts,
+        noiseAppCounts = noiseAppCounts
     )
 }
 
@@ -532,25 +593,48 @@ object NotificationStore {
 
     fun add(context: Context, item: DigestItem) {
         val existingItems = read(context)
-        if (existingItems.any { it.id == item.id || isSemanticDuplicate(it, item) }) return
+        val duplicateIndex = existingItems.indexOfFirst { it.id == item.id || isSemanticDuplicate(it, item) }
+        if (duplicateIndex >= 0) {
+            val existing = existingItems[duplicateIndex]
+            val updated = existing.copy(
+                notificationIconPath = existing.notificationIconPath.ifBlank { item.notificationIconPath },
+                contentImagePath = existing.contentImagePath.ifBlank { item.contentImagePath },
+                lines = existing.lines.ifEmpty { item.lines }
+            )
+            if (updated != existing) {
+                write(context, existingItems.toMutableList().also { it[duplicateIndex] = updated })
+            }
+            deleteUnusedNotificationMedia(context, item, updated)
+            return
+        }
 
         recordDailyStat(context, item)
         val items = existingItems.toMutableList()
         items.add(0, item)
-        write(context, dedupe(items).take(MAX_ITEMS))
+        val deduped = dedupe(items)
+        val kept = deduped.take(MAX_ITEMS)
+        deleteNotificationMedia(context, deduped.drop(MAX_ITEMS))
+        write(context, kept)
     }
 
     fun dismiss(context: Context, id: String) {
-        write(context, read(context).filterNot { it.id == id })
+        val current = read(context)
+        val removed = current.filter { it.id == id }
+        write(context, current.filterNot { it.id == id })
+        deleteNotificationMedia(context, removed)
     }
 
     fun dismissMany(context: Context, ids: Set<String>) {
         if (ids.isEmpty()) return
-        write(context, read(context).filterNot { it.id in ids })
+        val current = read(context)
+        val removed = current.filter { it.id in ids }
+        write(context, current.filterNot { it.id in ids })
+        deleteNotificationMedia(context, removed)
     }
 
     fun clearAll(context: Context) {
         write(context, emptyList())
+        clearNotificationMedia(context)
     }
 
     fun read(context: Context): List<DigestItem> {
@@ -563,6 +647,7 @@ object NotificationStore {
                 val text = item.optString("text")
                 val appName = item.optString("appName")
                 val classification = DigestClassifier.classify(context, title, text, appName)
+                val linesJson = item.optJSONArray("lines") ?: JSONArray()
                 DigestItem(
                     id = item.optString("id"),
                     notificationKey = item.optString("notificationKey", item.optString("id")),
@@ -572,7 +657,11 @@ object NotificationStore {
                     text = text,
                     timeMillis = item.optLong("timeMillis"),
                     category = classification.category,
-                    priority = classification.priority
+                    priority = classification.priority,
+                    notificationIconPath = item.optString("notificationIconPath"),
+                    contentImagePath = item.optString("contentImagePath"),
+                    lines = List(linesJson.length()) { lineIndex -> linesJson.optString(lineIndex) }
+                        .filter { it.isNotBlank() }
                 )
             }
         }.map { dedupe(it) }.getOrDefault(emptyList())
@@ -600,10 +689,14 @@ object NotificationStore {
 
         val appCounts = stats.appCounts.toMutableMap()
         appCounts[item.appName] = (appCounts[item.appName] ?: 0) + 1
-        val topApp = appCounts.maxByOrNull { it.value }
         val isSameDay = stats.dateKey == today
         val isPriority = item.priority == "Priority"
         val isNoisy = isNoise(item)
+        val priorityAppCounts = stats.priorityAppCounts.toMutableMap()
+        if (isPriority) priorityAppCounts[item.appName] = (priorityAppCounts[item.appName] ?: 0) + 1
+        val noiseAppCounts = stats.noiseAppCounts.toMutableMap()
+        if (isNoisy) noiseAppCounts[item.appName] = (noiseAppCounts[item.appName] ?: 0) + 1
+        val topApp = appCounts.maxByOrNull { it.value }
         val updated = PersistedDailyStats(
             dateKey = today,
             totalCount = if (isSameDay) stats.totalCount + 1 else 1,
@@ -613,7 +706,9 @@ object NotificationStore {
             topAppCount = topApp?.value ?: 0,
             yesterdayTotalCount = if (stats.dateKey == today) stats.yesterdayTotalCount else stats.totalCount,
             yesterdayNoiseCount = if (stats.dateKey == today) stats.yesterdayNoiseCount else stats.noiseCount,
-            appCounts = appCounts
+            appCounts = appCounts,
+            priorityAppCounts = priorityAppCounts,
+            noiseAppCounts = noiseAppCounts
         )
         writeDailyStats(context, updated)
     }
@@ -623,9 +718,6 @@ object NotificationStore {
         val raw = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(KEY_DAILY_STATS, "").orEmpty()
         val parsed = runCatching {
             val json = JSONObject(raw)
-            val countsJson = json.optJSONObject("appCounts") ?: JSONObject()
-            val appCounts = mutableMapOf<String, Int>()
-            countsJson.keys().forEach { key -> appCounts[key] = countsJson.optInt(key) }
             PersistedDailyStats(
                 dateKey = json.optString("dateKey"),
                 totalCount = json.optInt("totalCount"),
@@ -635,7 +727,9 @@ object NotificationStore {
                 topAppCount = json.optInt("topAppCount"),
                 yesterdayTotalCount = json.optInt("yesterdayTotalCount"),
                 yesterdayNoiseCount = json.optInt("yesterdayNoiseCount"),
-                appCounts = appCounts
+                appCounts = readCountMap(json.optJSONObject("appCounts")),
+                priorityAppCounts = readCountMap(json.optJSONObject("priorityAppCounts")),
+                noiseAppCounts = readCountMap(json.optJSONObject("noiseAppCounts"))
             )
         }.getOrDefault(PersistedDailyStats.empty(today))
 
@@ -650,8 +744,6 @@ object NotificationStore {
     }
 
     private fun writeDailyStats(context: Context, stats: PersistedDailyStats) {
-        val appCounts = JSONObject()
-        stats.appCounts.forEach { (appName, count) -> appCounts.put(appName, count) }
         val json = JSONObject()
             .put("dateKey", stats.dateKey)
             .put("totalCount", stats.totalCount)
@@ -661,16 +753,39 @@ object NotificationStore {
             .put("topAppCount", stats.topAppCount)
             .put("yesterdayTotalCount", stats.yesterdayTotalCount)
             .put("yesterdayNoiseCount", stats.yesterdayNoiseCount)
-            .put("appCounts", appCounts)
+            .put("appCounts", writeCountMap(stats.appCounts))
+            .put("priorityAppCounts", writeCountMap(stats.priorityAppCounts))
+            .put("noiseAppCounts", writeCountMap(stats.noiseAppCounts))
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             .edit()
             .putString(KEY_DAILY_STATS, json.toString())
             .apply()
     }
 
+    private fun readCountMap(json: JSONObject?): Map<String, Int> {
+        if (json == null) return emptyMap()
+        val counts = mutableMapOf<String, Int>()
+        json.keys().forEach { key -> counts[key] = json.optInt(key) }
+        return counts
+    }
+
+    private fun writeCountMap(counts: Map<String, Int>): JSONObject {
+        val json = JSONObject()
+        counts.forEach { (appName, count) -> json.put(appName, count) }
+        return json
+    }
+
     private fun persistedFromVisibleStats(stats: DailyStats, visibleItems: List<DigestItem>): PersistedDailyStats {
         val appCounts = visibleItems
             .filter { dayKey(it.timeMillis) == stats.dateKey }
+            .groupingBy { it.appName }
+            .eachCount()
+        val priorityAppCounts = visibleItems
+            .filter { dayKey(it.timeMillis) == stats.dateKey && it.priority == "Priority" }
+            .groupingBy { it.appName }
+            .eachCount()
+        val noiseAppCounts = visibleItems
+            .filter { dayKey(it.timeMillis) == stats.dateKey && isNoise(it) }
             .groupingBy { it.appName }
             .eachCount()
         return PersistedDailyStats(
@@ -682,7 +797,9 @@ object NotificationStore {
             topAppCount = stats.topAppCount,
             yesterdayTotalCount = stats.yesterdayTotalCount,
             yesterdayNoiseCount = stats.yesterdayNoiseCount,
-            appCounts = appCounts
+            appCounts = appCounts,
+            priorityAppCounts = priorityAppCounts,
+            noiseAppCounts = noiseAppCounts
         )
     }
 
@@ -717,6 +834,9 @@ object NotificationStore {
                     .put("timeMillis", item.timeMillis)
                     .put("category", item.category)
                     .put("priority", item.priority)
+                    .put("notificationIconPath", item.notificationIconPath)
+                    .put("contentImagePath", item.contentImagePath)
+                    .put("lines", JSONArray(item.lines))
             )
         }
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
@@ -779,6 +899,7 @@ fun NotifyDigestApp() {
     var listenerStatus by remember { mutableStateOf(ListenerHealth.read(context)) }
     var selectedItem by remember { mutableStateOf<DigestItem?>(null) }
     var dailyStats by remember { mutableStateOf(NotificationStore.readDailyStats(context, items)) }
+    val expandedCards = remember { mutableStateMapOf<String, Boolean>() }
 
     fun refreshPermissionState(showPromptWhenMissing: Boolean) {
         val enabled = hasNotificationAccess(context)
@@ -862,18 +983,12 @@ fun NotifyDigestApp() {
                         HeroCard(
                             hasAccess = hasAccess,
                             dailyStats = dailyStats,
+                            items = items,
                             onEnable = {
                                 context.startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
                             },
                             onRefresh = {
                                 refreshPermissionState(showPromptWhenMissing = true)
-                            },
-                            onClearTodayNoise = {
-                                val todayNoise = items.filter { isToday(it.timeMillis) && isNoise(it) }
-                                clearTodayNoiseNotifications(context, todayNoise)
-                                items = loadInbox(context)
-                                dailyStats = NotificationStore.readDailyStats(context, items)
-                                listenerStatus = ListenerHealth.read(context)
                             }
                         )
                     }
@@ -883,18 +998,11 @@ fun NotifyDigestApp() {
                             selected = filter,
                             items = items,
                             selectedPackage = appFilter,
-                            onPick = { filter = it }
+                            scopedItems = filterScopedItems,
+                            appFilter = appFilter,
+                            onPick = { filter = it },
+                            onPickApp = { appFilter = it }
                         )
-                    }
-                    if (items.isNotEmpty()) {
-                        item {
-                            AppFilterRow(
-                                selectedPackage = appFilter,
-                                items = items,
-                                scopedItems = filterScopedItems,
-                                onPick = { appFilter = it }
-                            )
-                        }
                     }
                     val visible = filteredByApp(filterScopedItems, appFilter)
                     if (items.isNotEmpty()) {
@@ -924,6 +1032,8 @@ fun NotifyDigestApp() {
                         items(visible, key = { it.id }) { item ->
                             NotificationCard(
                                 item = item,
+                                expanded = expandedCards[item.id] == true,
+                                onToggleExpanded = { expandedCards[item.id] = expandedCards[item.id] != true },
                                 onClick = { selectedItem = item },
                                 onOpen = { openSourceApp(context, item) },
                                 onDismiss = {
@@ -980,6 +1090,8 @@ private fun ListenerStatusCard(hasAccess: Boolean, status: ListenerStatus) {
 
 @Composable
 private fun NotificationAccessDialog(onEnable: () -> Unit, onLater: () -> Unit) {
+    val enableWithHaptic = hapticAction(onEnable)
+    val laterWithHaptic = hapticAction(onLater)
     AlertDialog(
         onDismissRequest = onLater,
         containerColor = Color.White,
@@ -995,13 +1107,13 @@ private fun NotificationAccessDialog(onEnable: () -> Unit, onLater: () -> Unit) 
         },
         confirmButton = {
             Button(
-                onClick = onEnable,
+                onClick = enableWithHaptic,
                 colors = ButtonDefaults.buttonColors(containerColor = Orange, contentColor = Color.White),
                 shape = RoundedCornerShape(14.dp)
             ) { Text("Enable", fontWeight = FontWeight.Black) }
         },
         dismissButton = {
-            TextButton(onClick = onLater) { Text("Later", color = Muted, fontWeight = FontWeight.Bold) }
+            TextButton(onClick = laterWithHaptic) { Text("Later", color = Muted, fontWeight = FontWeight.Bold) }
         }
     )
 }
@@ -1028,11 +1140,12 @@ private fun TopBar() {
 private fun HeroCard(
     hasAccess: Boolean,
     dailyStats: DailyStats,
+    items: List<DigestItem>,
     onEnable: () -> Unit,
-    onRefresh: () -> Unit,
-    onClearTodayNoise: () -> Unit
+    onRefresh: () -> Unit
 ) {
     var showPermissionTooltip by remember(hasAccess) { mutableStateOf(!hasAccess) }
+    var infoDialog by remember { mutableStateOf<StatInfo?>(null) }
 
     LaunchedEffect(hasAccess) {
         if (!hasAccess) {
@@ -1083,8 +1196,9 @@ private fun HeroCard(
                     Text("Daily Notification Digest", color = Muted, style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.Bold, maxLines = 1)
                 }
                 if (!hasAccess) {
+                    val enableWithHaptic = hapticAction(onEnable)
                     Button(
-                        onClick = onEnable,
+                        onClick = enableWithHaptic,
                         colors = ButtonDefaults.buttonColors(containerColor = Orange, contentColor = Color.White),
                         shape = RoundedCornerShape(14.dp)
                     ) { Text("Enable", fontWeight = FontWeight.Black) }
@@ -1097,16 +1211,21 @@ private fun HeroCard(
                 modifier = Modifier.horizontalScroll(rememberScrollState()),
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                CompactPill("Noise Score $noiseScore", Orange)
-                CompactPill("${dailyStats.totalCount} today", Blue)
-                CompactPill("${dailyStats.priorityCount} priority", Red)
-                CompactPill("${dailyStats.noiseCount} noisy", Orange)
+                CompactPill("Noise Score $noiseScore", Orange) {
+                    infoDialog = StatInfo.NoiseScore
+                }
+                CompactPill("${dailyStats.totalCount} today", Blue) {
+                    infoDialog = StatInfo.Today
+                }
+                CompactPill("${dailyStats.priorityCount} priority", Red) {
+                    infoDialog = StatInfo.Priority
+                }
+                CompactPill("${dailyStats.noiseCount} noisy", Orange) {
+                    infoDialog = StatInfo.Noisy
+                }
             }
             Text(comparisonLine, color = Ink, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Black, maxLines = 2)
             Text(topAppLine, color = Ink.copy(alpha = 0.78f), style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold, maxLines = 2)
-            if (dailyStats.noiseCount > 0) {
-                SmallAction("Clear today's noise", Orange, onClearTodayNoise)
-            }
         }
         if (!hasAccess && showPermissionTooltip) {
             PermissionTooltip(
@@ -1115,6 +1234,14 @@ private fun HeroCard(
                     .padding(top = 64.dp, end = 12.dp)
             )
         }
+    }
+    infoDialog?.let { statInfo ->
+        StatInfoDialog(
+            info = statInfo,
+            stats = dailyStats,
+            items = items,
+            onDismiss = { infoDialog = null }
+        )
     }
 }
 
@@ -1125,7 +1252,7 @@ private fun RefreshIconButton(onClick: () -> Unit) {
             .size(44.dp)
             .clip(CircleShape)
             .background(Orange)
-            .clickable(onClick = onClick),
+            .hapticClick(onClick),
         contentAlignment = Alignment.Center
     ) {
         Canvas(Modifier.size(22.dp)) {
@@ -1187,13 +1314,101 @@ private fun PermissionTooltip(modifier: Modifier = Modifier) {
     }
 }
 
+private sealed class StatInfo {
+    data object NoiseScore : StatInfo()
+    data object Today : StatInfo()
+    data object Priority : StatInfo()
+    data object Noisy : StatInfo()
+}
+
 @Composable
-private fun CompactPill(label: String, color: Color) {
+private fun StatInfoDialog(
+    info: StatInfo,
+    stats: DailyStats,
+    items: List<DigestItem>,
+    onDismiss: () -> Unit
+) {
+    val title = when (info) {
+        StatInfo.NoiseScore -> "Noise Score"
+        StatInfo.Today -> "Today's alerts"
+        StatInfo.Priority -> "Priority alerts"
+        StatInfo.Noisy -> "Noisy alerts"
+    }
+    val body = when (info) {
+        StatInfo.NoiseScore -> "Noise Score is the share of today's alerts marked noisy. Formula: noisy alerts / total alerts x 100. Today: ${stats.noiseCount} / ${stats.totalCount} = ${if (stats.totalCount == 0) 0 else stats.noiseCount * 100 / stats.totalCount}."
+        StatInfo.Today -> "Total notifications captured today across all apps."
+        StatInfo.Priority -> "Priority alerts are notifications classified as important, urgent, security-sensitive, money-related, OTP/login, calls, or calendar-like reminders."
+        StatInfo.Noisy -> "Noisy alerts are low-value or interruptive notifications, such as promotions, repeated app nudges, some system chatter, or anything classified as Noise."
+    }
+    val appBreakdownCounts = when (info) {
+        StatInfo.NoiseScore, StatInfo.Today -> stats.appCounts
+        StatInfo.Priority -> stats.priorityAppCounts
+        StatInfo.Noisy -> stats.noiseAppCounts
+    }
+    val appBreakdown = remember(info, stats) {
+        appBreakdownCounts.toList().sortedByDescending { it.second }.take(5)
+    }
+    val expectedBreakdownCount = when (info) {
+        StatInfo.NoiseScore, StatInfo.Today -> stats.totalCount
+        StatInfo.Priority -> stats.priorityCount
+        StatInfo.Noisy -> stats.noiseCount
+    }
+    val capturedBreakdownCount = appBreakdownCounts.values.sum()
+    val hasCompleteBreakdown = expectedBreakdownCount == 0 || capturedBreakdownCount >= expectedBreakdownCount
+    val closeWithHaptic = hapticAction(onDismiss)
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = Color.White,
+        title = { Text(title, color = Ink, fontWeight = FontWeight.Black, style = MaterialTheme.typography.titleLarge) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Text(body, color = Ink.copy(alpha = 0.78f), style = MaterialTheme.typography.bodyMedium)
+                if (appBreakdown.isNotEmpty()) {
+                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Text("Top apps", color = Ink, fontWeight = FontWeight.Black, style = MaterialTheme.typography.labelLarge)
+                        appBreakdown.forEach { (appName, count) ->
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(appName, color = Ink.copy(alpha = 0.82f), style = MaterialTheme.typography.bodyMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                Text("$count", color = Muted, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.labelLarge)
+                            }
+                        }
+                        if (!hasCompleteBreakdown) {
+                            Text(
+                                "Detailed app breakdown is being retained from new alerts now.",
+                                color = Muted,
+                                style = MaterialTheme.typography.bodySmall
+                            )
+                        }
+                    }
+                } else if (expectedBreakdownCount > 0) {
+                    Text("Detailed app breakdown is being retained from new alerts now.", color = Muted, style = MaterialTheme.typography.bodyMedium)
+                } else {
+                    Text("No matching alerts yet today.", color = Muted, style = MaterialTheme.typography.bodyMedium)
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = closeWithHaptic) {
+                Text("Got it", color = Orange, fontWeight = FontWeight.Black)
+            }
+        }
+    )
+}
+
+@Composable
+private fun CompactPill(label: String, color: Color, onClick: (() -> Unit)? = null) {
+    val modifier = Modifier
+        .clip(RoundedCornerShape(999.dp))
+        .background(color.copy(alpha = 0.10f))
+        .then(if (onClick != null) Modifier.hapticClick(onClick) else Modifier)
+        .padding(horizontal = 9.dp, vertical = 5.dp)
     Box(
-        modifier = Modifier
-            .clip(RoundedCornerShape(999.dp))
-            .background(color.copy(alpha = 0.10f))
-            .padding(horizontal = 9.dp, vertical = 5.dp)
+        modifier = modifier
     ) {
         Text(label, color = color, style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Black)
     }
@@ -1233,39 +1448,12 @@ private fun FilterRow(
     selected: String,
     items: List<DigestItem>,
     selectedPackage: String,
-    onPick: (String) -> Unit
+    scopedItems: List<DigestItem>,
+    appFilter: String,
+    onPick: (String) -> Unit,
+    onPickApp: (String) -> Unit
 ) {
     val filters = listOf("All", "Priority", "Calls", "Money", "Messages", "Email", "Orders", "Calendar", "Noise", "System")
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .horizontalScroll(rememberScrollState()),
-        horizontalArrangement = Arrangement.spacedBy(8.dp)
-    ) {
-        filters.forEach { filter ->
-            val active = selected == filter
-            val count = filteredByApp(filteredItems(items, filter), selectedPackage).size
-            Box(
-                modifier = Modifier
-                    .clip(RoundedCornerShape(999.dp))
-                    .background(if (active) Ink else Color.White)
-                    .border(1.dp, if (active) Ink else Line, RoundedCornerShape(999.dp))
-                    .clickable { onPick(filter) }
-                    .padding(horizontal = 16.dp, vertical = 10.dp)
-            ) {
-                Text("$filter $count", color = if (active) Color.White else Ink, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.labelLarge)
-            }
-        }
-    }
-}
-
-@Composable
-private fun AppFilterRow(
-    selectedPackage: String,
-    items: List<DigestItem>,
-    scopedItems: List<DigestItem>,
-    onPick: (String) -> Unit
-) {
     val appNames = items
         .groupBy { it.packageName }
         .mapValues { (_, appItems) -> appItems.first().appName }
@@ -1273,61 +1461,99 @@ private fun AppFilterRow(
         .groupBy { it.packageName }
         .map { (packageName, appItems) -> AppFilterOption(packageName, appItems.first().appName, appItems.size) }
         .sortedWith(compareByDescending<AppFilterOption> { it.count }.thenBy { it.appName.lowercase() })
-    val selectedAppName = if (selectedPackage == ALL_APPS_FILTER) {
-        "All apps"
-    } else {
-        appNames[selectedPackage] ?: "Selected app"
-    }
-    val selectedCount = if (selectedPackage == ALL_APPS_FILTER) {
-        scopedItems.size
-    } else {
-        scopedItems.count { it.packageName == selectedPackage }
-    }
-    val selectedLabel = "$selectedAppName $selectedCount"
-    var expanded by remember { mutableStateOf(false) }
-    Box(
-        modifier = Modifier
-            .fillMaxWidth()
-            .wrapContentSize(Alignment.TopStart)
+    val selectedAppName = if (appFilter == ALL_APPS_FILTER) "All apps" else appNames[appFilter] ?: "Selected app"
+    val selectedCount = if (appFilter == ALL_APPS_FILTER) scopedItems.size else scopedItems.count { it.packageName == appFilter }
+    var appMenuExpanded by remember { mutableStateOf(false) }
+    val haptic = LocalHapticFeedback.current
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(6.dp)
     ) {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .clip(RoundedCornerShape(20.dp))
-                .background(Color.White)
-                .border(1.dp, Line, RoundedCornerShape(20.dp))
-                .clickable { expanded = true }
-                .padding(12.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(10.dp)
+                .horizontalScroll(rememberScrollState()),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            SourceAppIcon(packageName = selectedPackage, appName = selectedAppName, modifier = Modifier.size(34.dp), accent = Orange)
-            Column(Modifier.weight(1f)) {
-                Text("Filter by app", color = Muted, style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold)
-                Text(selectedLabel, color = Ink, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Black, maxLines = 1, overflow = TextOverflow.Ellipsis)
-            }
-            Text("Change", color = Orange, style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.Black)
-        }
-        DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
-            DropdownMenuItem(
-                text = { Text("All apps ${scopedItems.size}", color = Ink, fontWeight = FontWeight.Bold) },
-                leadingIcon = { SourceAppIcon(packageName = ALL_APPS_FILTER, appName = "All", modifier = Modifier.size(28.dp), accent = Orange) },
-                onClick = {
-                    onPick(ALL_APPS_FILTER)
-                    expanded = false
-                }
-            )
-            appCounts.forEach { option ->
-                DropdownMenuItem(
-                    text = { Text("${option.appName} ${option.count}", color = Ink, fontWeight = FontWeight.Bold) },
-                    leadingIcon = { SourceAppIcon(packageName = option.packageName, appName = option.appName, modifier = Modifier.size(28.dp), accent = Orange) },
-                    onClick = {
-                        onPick(option.packageName)
-                        expanded = false
-                    }
+            Box {
+                FilterChip(
+                    label = "$selectedAppName $selectedCount",
+                    active = appFilter != ALL_APPS_FILTER,
+                    onClick = { appMenuExpanded = true },
+                    leading = "A"
                 )
+                DropdownMenu(expanded = appMenuExpanded, onDismissRequest = { appMenuExpanded = false }) {
+                    DropdownMenuItem(
+                        text = { Text("All apps ${scopedItems.size}", color = Ink, fontWeight = FontWeight.Bold) },
+                        leadingIcon = { SourceAppIcon(packageName = ALL_APPS_FILTER, appName = "All", modifier = Modifier.size(28.dp), accent = Orange) },
+                        onClick = {
+                            haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                            onPickApp(ALL_APPS_FILTER)
+                            appMenuExpanded = false
+                        }
+                    )
+                    appCounts.forEach { option ->
+                        DropdownMenuItem(
+                            text = { Text("${option.appName} ${option.count}", color = Ink, fontWeight = FontWeight.Bold) },
+                            leadingIcon = { SourceAppIcon(packageName = option.packageName, appName = option.appName, modifier = Modifier.size(28.dp), accent = Orange) },
+                            onClick = {
+                                haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                onPickApp(option.packageName)
+                                appMenuExpanded = false
+                            }
+                        )
+                    }
+                }
+            }
+            filters.forEach { filter ->
+                val active = selected == filter
+                val count = filteredByApp(filteredItems(items, filter), selectedPackage).size
+                FilterChip(label = "$filter $count", active = active, onClick = { onPick(filter) })
             }
         }
+        if (appFilter != ALL_APPS_FILTER) {
+            Text(
+                "Filtered by $selectedAppName",
+                color = Muted,
+                style = MaterialTheme.typography.labelMedium,
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+    }
+}
+
+@Composable
+private fun FilterChip(
+    label: String,
+    active: Boolean,
+    onClick: () -> Unit,
+    leading: String? = null
+) {
+    Row(
+        modifier = Modifier
+            .height(42.dp)
+            .clip(RoundedCornerShape(999.dp))
+            .background(if (active) Ink else Color.White.copy(alpha = 0.82f))
+            .border(1.dp, if (active) Ink else Line, RoundedCornerShape(999.dp))
+            .hapticClick(onClick)
+            .padding(horizontal = if (leading == null) 14.dp else 10.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(7.dp)
+    ) {
+        if (leading != null) {
+            Box(
+                modifier = Modifier
+                    .size(24.dp)
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(if (active) Color.White.copy(alpha = 0.16f) else Cream),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(leading, color = if (active) Color.White else Orange, fontWeight = FontWeight.Black, style = MaterialTheme.typography.labelMedium)
+            }
+        }
+        Text(label, color = if (active) Color.White else Ink, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.labelLarge, maxLines = 1)
     }
 }
 
@@ -1359,19 +1585,98 @@ private fun SourceAppIcon(packageName: String, appName: String, modifier: Modifi
 }
 
 @Composable
+private fun NotificationSourceIcon(item: DigestItem, modifier: Modifier = Modifier, accent: Color = Orange) {
+    val notificationBitmap = rememberBitmap(item.notificationIconPath)
+    Box(modifier = modifier, contentAlignment = Alignment.Center) {
+        if (notificationBitmap != null) {
+            Image(
+                bitmap = notificationBitmap.asImageBitmap(),
+                contentDescription = item.appName,
+                modifier = Modifier
+                    .fillMaxSize()
+                    .clip(RoundedCornerShape(12.dp)),
+                contentScale = ContentScale.Crop
+            )
+            Box(
+                modifier = Modifier
+                    .align(Alignment.BottomEnd)
+                    .size(19.dp)
+                    .clip(CircleShape)
+                    .background(Color.White)
+                    .padding(1.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                SourceAppIcon(
+                    packageName = item.packageName,
+                    appName = item.appName,
+                    modifier = Modifier.fillMaxSize(),
+                    accent = accent
+                )
+            }
+        } else {
+            SourceAppIcon(
+                packageName = item.packageName,
+                appName = item.appName,
+                modifier = Modifier.fillMaxSize(),
+                accent = accent
+            )
+        }
+    }
+}
+
+@Composable
+private fun NotificationContentImage(path: String, modifier: Modifier = Modifier) {
+    val bitmap = rememberBitmap(path) ?: return
+    Image(
+        bitmap = bitmap.asImageBitmap(),
+        contentDescription = "Notification image",
+        modifier = modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(18.dp))
+            .background(Line),
+        contentScale = ContentScale.Crop
+    )
+}
+
+@Composable
+private fun rememberBitmap(path: String): Bitmap? {
+    return remember(path) {
+        path.takeIf { it.isNotBlank() }?.let { BitmapFactory.decodeFile(it) }
+    }
+}
+
+@Composable
 private fun NotificationDetailDialog(
     item: DigestItem,
     onDismiss: () -> Unit,
     onOpen: () -> Unit,
     onClear: () -> Unit
 ) {
+    val context = LocalContext.current
+    val canOpenApp = remember(item.packageName) { hasLaunchableSourceApp(context, item) }
+    val openWithHaptic = hapticAction(onOpen)
+    val clearWithHaptic = hapticAction(onClear)
+    val dismissWithHaptic = hapticAction(onDismiss)
     AlertDialog(
         onDismissRequest = onDismiss,
         containerColor = Color.White,
         title = {
-            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                Text(item.title, color = Ink, fontWeight = FontWeight.Black, style = MaterialTheme.typography.titleLarge)
-                Text("${item.appName} - ${formatTime(item.timeMillis)}", color = Muted, style = MaterialTheme.typography.labelMedium)
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                NotificationSourceIcon(item = item, modifier = Modifier.size(50.dp), accent = categoryAccent(item.category))
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.weight(1f)) {
+                    Text(
+                        item.title,
+                        color = Ink,
+                        fontWeight = FontWeight.Black,
+                        style = MaterialTheme.typography.titleLarge,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    Text("${item.appName} - ${formatTime(item.timeMillis)}", color = Muted, style = MaterialTheme.typography.labelMedium)
+                }
             }
         },
         text = {
@@ -1385,41 +1690,49 @@ private fun NotificationDetailDialog(
                     CategoryPill(item.category)
                     PriorityTag(item.priority)
                 }
-                Text(
-                    item.text.ifBlank { "No extra notification text." },
-                    color = Ink.copy(alpha = 0.82f),
-                    style = MaterialTheme.typography.bodyMedium
+                NotificationContentImage(
+                    path = item.contentImagePath,
+                    modifier = Modifier.height(220.dp)
                 )
+                displayNotificationLines(item).forEach { line ->
+                    SenderMessageLine(line)
+                }
             }
         },
         confirmButton = {
-            Button(
-                onClick = onOpen,
-                colors = ButtonDefaults.buttonColors(containerColor = Orange, contentColor = Color.White),
-                shape = RoundedCornerShape(14.dp)
-            ) { Text("Open app", fontWeight = FontWeight.Black) }
+            if (canOpenApp) {
+                Button(
+                    onClick = openWithHaptic,
+                    colors = ButtonDefaults.buttonColors(containerColor = Orange, contentColor = Color.White),
+                    shape = RoundedCornerShape(14.dp)
+                ) { Text("Open app", fontWeight = FontWeight.Black) }
+            }
         },
         dismissButton = {
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                TextButton(onClick = onClear) { Text("Clear", color = Red, fontWeight = FontWeight.Bold) }
-                TextButton(onClick = onDismiss) { Text("Close", color = Muted, fontWeight = FontWeight.Bold) }
+                TextButton(onClick = clearWithHaptic) { Text("Clear", color = Red, fontWeight = FontWeight.Bold) }
+                TextButton(onClick = dismissWithHaptic) { Text("Close", color = Muted, fontWeight = FontWeight.Bold) }
             }
         }
     )
 }
 
 @Composable
-private fun NotificationCard(item: DigestItem, onClick: () -> Unit, onOpen: () -> Unit, onDismiss: () -> Unit) {
-    val accent = when (item.category) {
-        "Money" -> Green
-        "Calls" -> Color(0xFF0F8B8D)
-        "Messages" -> Blue
-        "Email" -> Color(0xFFD94A38)
-        "Orders" -> Yellow
-        "Calendar" -> Color(0xFF7E57C2)
-        "Noise" -> Orange
-        "System" -> Color(0xFF607D8B)
-        else -> Ink
+private fun NotificationCard(
+    item: DigestItem,
+    expanded: Boolean,
+    onToggleExpanded: () -> Unit,
+    onClick: () -> Unit,
+    onOpen: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    val context = LocalContext.current
+    val canOpenApp = remember(item.packageName) { hasLaunchableSourceApp(context, item) }
+    val accent = categoryAccent(item.category)
+    val displayLines = remember(item.lines, item.text) { displayNotificationLines(item) }
+    val previewLine = displayLines.firstOrNull() ?: item.text
+    val toggleExpanded = {
+        onToggleExpanded()
     }
     Column(
         modifier = Modifier
@@ -1427,35 +1740,142 @@ private fun NotificationCard(item: DigestItem, onClick: () -> Unit, onOpen: () -
             .clip(RoundedCornerShape(26.dp))
             .background(Color.White)
             .border(1.dp, Line, RoundedCornerShape(26.dp))
-            .clickable(onClick = onClick)
+            .hapticClick(onClick = toggleExpanded)
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            Box(
-                modifier = Modifier
-                    .size(42.dp)
-                    .clip(CircleShape)
-                    .background(accent.copy(alpha = 0.13f)),
-                contentAlignment = Alignment.Center
-            ) {
-                SourceAppIcon(packageName = item.packageName, appName = item.appName, modifier = Modifier.size(42.dp), accent = accent)
-            }
+            NotificationSourceIcon(item = item, modifier = Modifier.size(42.dp), accent = accent)
             Spacer(Modifier.width(10.dp))
             Column(Modifier.weight(1f)) {
-                Text(item.title, color = Ink, fontWeight = FontWeight.Black, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                Text("${item.appName} - ${formatTime(item.timeMillis)}", color = Muted, style = MaterialTheme.typography.labelMedium)
+                Text(
+                    item.title,
+                    color = Ink,
+                    fontWeight = FontWeight.Black,
+                    style = MaterialTheme.typography.titleMedium,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                Text(
+                    "${item.appName} - ${formatTime(item.timeMillis)}",
+                    color = Muted,
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = FontWeight.SemiBold
+                )
             }
-            PriorityTag(item.priority)
+            Spacer(Modifier.width(8.dp))
+            ExpandCollapseButton(expanded = expanded, onClick = toggleExpanded)
         }
-        if (item.text.isNotBlank()) {
-            Text(item.text, color = Ink.copy(alpha = 0.78f), style = MaterialTheme.typography.bodyMedium, maxLines = 3, overflow = TextOverflow.Ellipsis)
+        if (expanded) {
+            Column(
+                modifier = Modifier.hapticClick(onClick = onClick),
+                verticalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                displayLines.forEach { line ->
+                    SenderMessageLine(line)
+                }
+            }
+            NotificationContentImage(
+                path = item.contentImagePath,
+                modifier = Modifier
+                    .height(150.dp)
+                    .hapticClick(onClick = onClick)
+            )
+            CategoryPill(item.category)
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                if (canOpenApp) {
+                    SmallAction("Open app", Orange, onOpen)
+                }
+                SmallAction("Clear", Ink, onDismiss)
+            }
+        } else {
+            if (previewLine.isNotBlank()) {
+                Row(
+                    verticalAlignment = Alignment.Top,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Box(Modifier.weight(1f)) {
+                        SenderMessageLine(previewLine, maxLines = 2, compact = true)
+                    }
+                    PriorityTag(item.priority)
+                }
+            }
         }
-        CategoryPill(item.category)
-        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            SmallAction("Open app", Orange, onOpen)
-            SmallAction("Clear", Ink, onDismiss)
+    }
+}
+
+@Composable
+private fun ExpandCollapseButton(expanded: Boolean, onClick: () -> Unit) {
+    val rotation by animateFloatAsState(
+        targetValue = if (expanded) 180f else 0f,
+        animationSpec = tween(durationMillis = 180, easing = FastOutSlowInEasing),
+        label = "expand-chevron"
+    )
+    Box(
+        modifier = Modifier
+            .size(34.dp)
+            .clip(CircleShape)
+            .background(Color(0xFFF5F8FC))
+            .border(1.dp, Color(0xFFE5ECF5), CircleShape)
+            .hapticClick(onClick = onClick),
+        contentAlignment = Alignment.Center
+    ) {
+        Canvas(
+            modifier = Modifier
+                .size(16.dp)
+                .graphicsLayer { rotationZ = rotation }
+        ) {
+            val strokeWidth = size.width * 0.16f
+            drawLine(
+                color = Muted,
+                start = Offset(size.width * 0.22f, size.height * 0.38f),
+                end = Offset(size.width * 0.50f, size.height * 0.66f),
+                strokeWidth = strokeWidth,
+                cap = StrokeCap.Round
+            )
+            drawLine(
+                color = Muted,
+                start = Offset(size.width * 0.78f, size.height * 0.38f),
+                end = Offset(size.width * 0.50f, size.height * 0.66f),
+                strokeWidth = strokeWidth,
+                cap = StrokeCap.Round
+            )
         }
+    }
+}
+
+@Composable
+private fun SenderMessageLine(line: String, maxLines: Int = Int.MAX_VALUE, compact: Boolean = false) {
+    val sender = line.substringBefore(": ", "")
+    val message = line.substringAfter(": ", line)
+    if (sender.isNotBlank() && message != line) {
+        Column(verticalArrangement = Arrangement.spacedBy(if (compact) 1.dp else 2.dp)) {
+            Text(
+                sender,
+                color = Ink.copy(alpha = if (compact) 0.88f else 0.92f),
+                fontWeight = if (compact) FontWeight.SemiBold else FontWeight.Bold,
+                style = if (compact) MaterialTheme.typography.labelLarge else MaterialTheme.typography.bodyMedium,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            Text(
+                message,
+                color = Ink.copy(alpha = 0.70f),
+                fontWeight = FontWeight.Normal,
+                maxLines = maxLines,
+                overflow = TextOverflow.Ellipsis,
+                style = MaterialTheme.typography.bodyMedium
+            )
+        }
+    } else {
+        Text(
+            line,
+            color = Ink.copy(alpha = 0.72f),
+            fontWeight = FontWeight.Normal,
+            maxLines = maxLines,
+            overflow = TextOverflow.Ellipsis,
+            style = MaterialTheme.typography.bodyMedium
+        )
     }
 }
 
@@ -1499,7 +1919,7 @@ private fun SmallAction(label: String, color: Color, onClick: () -> Unit) {
         modifier = Modifier
             .clip(RoundedCornerShape(999.dp))
             .background(color)
-            .clickable(onClick = onClick)
+            .hapticClick(onClick = onClick)
             .padding(horizontal = 14.dp, vertical = 8.dp)
     ) {
         Text(label, color = Color.White, fontWeight = FontWeight.Black, style = MaterialTheme.typography.labelMedium)
@@ -1624,6 +2044,24 @@ private fun isNoise(item: DigestItem): Boolean {
     return item.priority == "Noise" || item.category == "Noise"
 }
 
+private fun displayNotificationLines(item: DigestItem): List<String> {
+    return item.lines.ifEmpty { listOf(item.text.ifBlank { "No extra notification text." }) }
+}
+
+private fun categoryAccent(category: String): Color {
+    return when (category) {
+        "Money" -> Green
+        "Calls" -> Color(0xFF0F8B8D)
+        "Messages" -> Blue
+        "Email" -> Color(0xFFD94A38)
+        "Orders" -> Yellow
+        "Calendar" -> Color(0xFF7E57C2)
+        "Noise" -> Orange
+        "System" -> Color(0xFF607D8B)
+        else -> Ink
+    }
+}
+
 private fun filteredByApp(items: List<DigestItem>, packageName: String): List<DigestItem> {
     return if (packageName == ALL_APPS_FILTER) items else items.filter { it.packageName == packageName }
 }
@@ -1643,10 +2081,16 @@ private fun buildDailyStats(items: List<DigestItem>): DailyStats {
     val yesterday = dayKey(now - 24L * 60L * 60L * 1000L)
     val todayItems = items.filter { dayKey(it.timeMillis) == today }
     val yesterdayItems = items.filter { dayKey(it.timeMillis) == yesterday }
-    val topApp = todayItems
+    val appCounts = todayItems.groupingBy { it.appName }.eachCount()
+    val priorityAppCounts = todayItems
+        .filter { it.priority == "Priority" }
         .groupingBy { it.appName }
         .eachCount()
-        .maxByOrNull { it.value }
+    val noiseAppCounts = todayItems
+        .filter { isNoise(it) }
+        .groupingBy { it.appName }
+        .eachCount()
+    val topApp = appCounts.maxByOrNull { it.value }
 
     return DailyStats(
         dateKey = today,
@@ -1656,7 +2100,10 @@ private fun buildDailyStats(items: List<DigestItem>): DailyStats {
         topAppName = topApp?.key.orEmpty(),
         topAppCount = topApp?.value ?: 0,
         yesterdayTotalCount = yesterdayItems.size,
-        yesterdayNoiseCount = yesterdayItems.count { isNoise(it) }
+        yesterdayNoiseCount = yesterdayItems.count { isNoise(it) },
+        appCounts = appCounts,
+        priorityAppCounts = priorityAppCounts,
+        noiseAppCounts = noiseAppCounts
     )
 }
 
@@ -1704,6 +2151,11 @@ private fun markNotificationDone(context: Context, item: DigestItem) {
     Toast.makeText(context, message, Toast.LENGTH_SHORT).show()
 }
 
+private fun hasLaunchableSourceApp(context: Context, item: DigestItem): Boolean {
+    return item.packageName.isNotBlank() &&
+        context.packageManager.getLaunchIntentForPackage(item.packageName) != null
+}
+
 private fun openSourceApp(context: Context, item: DigestItem) {
     DigestNotificationListener.cancelNotificationFromShade(item.notificationKey)
     val intent = context.packageManager.getLaunchIntentForPackage(item.packageName)
@@ -1726,6 +2178,174 @@ private fun hasNotificationAccess(context: Context): Boolean {
     val flat = Settings.Secure.getString(context.contentResolver, "enabled_notification_listeners") ?: return false
     val expected = ComponentName(context, DigestNotificationListener::class.java).flattenToString()
     return flat.split(':').any { it.equals(expected, ignoreCase = true) }
+}
+
+private fun extractNotificationIconBitmap(context: Context, notification: Notification): Bitmap? {
+    return runCatching {
+        notification.getLargeIcon()?.loadDrawable(context)?.let { drawableToBitmap(it) }
+    }.getOrNull() ?: notification.extras.parcelableCompat<Bitmap>("android.largeIcon")
+}
+
+private fun extractNotificationPictureBitmap(context: Context, notification: Notification): Bitmap? {
+    val extras = notification.extras
+    return extras.parcelableCompat<Bitmap>(Notification.EXTRA_PICTURE)
+        ?: extras.parcelableCompat<Icon>("android.pictureIcon")?.let { icon ->
+            runCatching { icon.loadDrawable(context)?.let { drawableToBitmap(it) } }.getOrNull()
+        }
+        ?: extractMessagingStyleImageBitmap(context, extras)
+}
+
+private fun extractMessagingStyleImageBitmap(context: Context, extras: Bundle): Bitmap? {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) return null
+    val messages = extras.parcelableArrayCompat(Notification.EXTRA_MESSAGES) ?: return null
+    return runCatching {
+        Notification.MessagingStyle.Message.getMessagesFromBundleArray(messages)
+            .firstNotNullOfOrNull { message ->
+                val mimeType = message.dataMimeType.orEmpty()
+                val dataUri = message.dataUri
+                if (mimeType.startsWith("image/") && dataUri != null) {
+                    decodeBitmapUri(context, dataUri)
+                } else {
+                    null
+                }
+        }
+    }.getOrNull()
+}
+
+private fun extractNotificationLines(notification: Notification): List<String> {
+    val extras = notification.extras
+    val messagingLines = extractMessagingStyleLines(extras)
+    if (messagingLines.isNotEmpty()) return messagingLines
+
+    val textLines = extras.getCharSequenceArray(Notification.EXTRA_TEXT_LINES)
+        ?.map { it.toString() }
+        ?.filter { it.isNotBlank() }
+        .orEmpty()
+    if (textLines.isNotEmpty()) return textLines
+
+    return listOfNotNull(
+        extras.getCharSequence(Notification.EXTRA_BIG_TEXT)?.toString(),
+        extras.getCharSequence(Notification.EXTRA_TEXT)?.toString()
+    )
+        .filter { it.isNotBlank() }
+        .distinct()
+}
+
+private fun extractMessagingStyleLines(extras: Bundle): List<String> {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) return emptyList()
+    val messages = extras.parcelableArrayCompat(Notification.EXTRA_MESSAGES) ?: return emptyList()
+    return runCatching {
+        Notification.MessagingStyle.Message.getMessagesFromBundleArray(messages)
+            .mapNotNull { message ->
+                val text = message.text?.toString().orEmpty()
+                val sender = messageSenderName(message)
+                when {
+                    sender.isNotBlank() && text.isNotBlank() -> "$sender: $text"
+                    text.isNotBlank() -> text
+                    sender.isNotBlank() && message.dataMimeType?.startsWith("image/") == true -> "$sender: Photo"
+                    message.dataMimeType?.startsWith("image/") == true -> "Photo"
+                    else -> null
+                }
+            }
+    }.getOrDefault(emptyList())
+}
+
+private fun messageSenderName(message: Notification.MessagingStyle.Message): String {
+    return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+        message.senderPerson?.name?.toString().orEmpty()
+    } else {
+        @Suppress("DEPRECATION")
+        message.sender?.toString().orEmpty()
+    }
+}
+
+private fun decodeBitmapUri(context: Context, uri: Uri): Bitmap? {
+    return runCatching {
+        context.contentResolver.openInputStream(uri)?.use { input ->
+            BitmapFactory.decodeStream(input)
+        }
+    }.getOrNull()
+}
+
+private inline fun <reified T> Bundle.parcelableCompat(key: String): T? {
+    return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        getParcelable(key, T::class.java)
+    } else {
+        @Suppress("DEPRECATION")
+        getParcelable(key) as? T
+    }
+}
+
+private fun Bundle.parcelableArrayCompat(key: String): Array<Parcelable>? {
+    return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        getParcelableArray(key, Parcelable::class.java)
+    } else {
+        @Suppress("DEPRECATION")
+        getParcelableArray(key)
+    }
+}
+
+private fun saveNotificationBitmap(
+    context: Context,
+    itemId: String,
+    kind: String,
+    bitmap: Bitmap?,
+    maxDimension: Int
+): String? {
+    if (bitmap == null || bitmap.width <= 0 || bitmap.height <= 0) return null
+    val directory = notificationMediaDir(context).apply { mkdirs() }
+    val file = File(directory, "${Integer.toHexString(itemId.hashCode())}_$kind.png")
+    val largestSide = if (bitmap.width > bitmap.height) bitmap.width else bitmap.height
+    val outputBitmap = if (largestSide > maxDimension) {
+        val scale = maxDimension.toFloat() / largestSide.toFloat()
+        Bitmap.createScaledBitmap(
+            bitmap,
+            (bitmap.width * scale).toInt().coerceAtLeast(1),
+            (bitmap.height * scale).toInt().coerceAtLeast(1),
+            true
+        )
+    } else {
+        bitmap
+    }
+    runCatching {
+        FileOutputStream(file).use { outputBitmap.compress(Bitmap.CompressFormat.PNG, 100, it) }
+    }.getOrElse { return null }
+    return file.absolutePath
+}
+
+private fun deleteNotificationMedia(context: Context, item: DigestItem) {
+    deleteNotificationMedia(context, listOf(item))
+}
+
+private fun deleteUnusedNotificationMedia(context: Context, newItem: DigestItem, keptItem: DigestItem) {
+    val keptPaths = setOf(keptItem.notificationIconPath, keptItem.contentImagePath)
+    val unusedItem = newItem.copy(
+        notificationIconPath = newItem.notificationIconPath.takeUnless { it in keptPaths }.orEmpty(),
+        contentImagePath = newItem.contentImagePath.takeUnless { it in keptPaths }.orEmpty()
+    )
+    deleteNotificationMedia(context, unusedItem)
+}
+
+private fun deleteNotificationMedia(context: Context, items: List<DigestItem>) {
+    val mediaRoot = notificationMediaDir(context).absolutePath
+    items.flatMap { listOf(it.notificationIconPath, it.contentImagePath) }
+        .filter { it.isNotBlank() }
+        .forEach { path ->
+            val file = File(path)
+            if (file.absolutePath.startsWith(mediaRoot)) {
+                runCatching { file.delete() }
+            }
+        }
+}
+
+private fun clearNotificationMedia(context: Context) {
+    notificationMediaDir(context).listFiles()?.forEach { file ->
+        runCatching { file.delete() }
+    }
+}
+
+private fun notificationMediaDir(context: Context): File {
+    return File(context.filesDir, "notification_media")
 }
 
 private fun drawableToBitmap(drawable: Drawable): Bitmap {
