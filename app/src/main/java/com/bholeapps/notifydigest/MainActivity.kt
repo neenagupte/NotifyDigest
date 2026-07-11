@@ -1,6 +1,7 @@
 package com.bholeapps.notifydigest
 
 import android.app.Notification
+import android.app.PendingIntent
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
@@ -12,11 +13,14 @@ import android.graphics.drawable.Icon
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.os.Parcelable
 import android.provider.Settings
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
 import android.text.TextUtils
+import android.view.SoundEffectConstants
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -64,7 +68,10 @@ import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
+import androidx.compose.material3.SwipeToDismissBox
+import androidx.compose.material3.SwipeToDismissBoxValue
 import androidx.compose.material3.Text
+import androidx.compose.material3.rememberSwipeToDismissBoxState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -72,23 +79,23 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
-import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
-import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.composed
@@ -102,6 +109,7 @@ import androidx.lifecycle.LifecycleEventObserver
 import org.json.JSONArray
 import org.json.JSONObject
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import org.tensorflow.lite.task.text.nlclassifier.NLClassifier
 import java.io.File
 import java.io.FileOutputStream
@@ -109,6 +117,7 @@ import kotlin.math.abs
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
 
 private fun Modifier.hapticClick(onClick: () -> Unit): Modifier = composed {
     val haptic = LocalHapticFeedback.current
@@ -145,17 +154,47 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
         setContent { NotifyDigestApp() }
     }
+
+    override fun onResume() {
+        super.onResume()
+        AppForegroundState.isForeground = true
+    }
+
+    override fun onPause() {
+        AppForegroundState.isForeground = false
+        super.onPause()
+    }
+}
+
+private object AppForegroundState {
+    @Volatile
+    var isForeground: Boolean = false
 }
 
 class DigestNotificationListener : NotificationListenerService() {
     companion object {
         private var activeService: DigestNotificationListener? = null
+        private val contentIntents = ConcurrentHashMap<String, PendingIntent>()
 
         fun cancelNotificationFromShade(key: String): Boolean {
             if (key.isBlank()) return false
             val service = activeService ?: return false
             return runCatching {
                 service.cancelNotification(key)
+                contentIntents.remove(key)
+                true
+            }.getOrDefault(false)
+        }
+
+        fun hasContentIntent(key: String): Boolean {
+            return key.isNotBlank() && contentIntents.containsKey(key)
+        }
+
+        fun sendContentIntent(key: String): Boolean {
+            if (key.isBlank()) return false
+            val pendingIntent = contentIntents[key] ?: return false
+            return runCatching {
+                pendingIntent.send()
                 true
             }.getOrDefault(false)
         }
@@ -209,6 +248,7 @@ class DigestNotificationListener : NotificationListenerService() {
         }.getOrDefault(sbn.packageName)
 
         val notificationKey = sbn.key
+        sbn.notification.contentIntent?.let { contentIntents[notificationKey] = it }
         val itemId = notificationKey.ifBlank { "${sbn.packageName}:${sbn.postTime}:${sbn.id}" }
         val classification = DigestClassifier.classify(applicationContext, title, mergedText, label)
         val notificationIconPath = saveNotificationBitmap(
@@ -241,6 +281,11 @@ class DigestNotificationListener : NotificationListenerService() {
         )
         NotificationStore.add(context = applicationContext, item = item)
         ListenerHealth.markCaptured(applicationContext, label)
+    }
+
+    override fun onNotificationRemoved(sbn: StatusBarNotification) {
+        contentIntents.remove(sbn.key)
+        super.onNotificationRemoved(sbn)
     }
 }
 
@@ -986,9 +1031,6 @@ fun NotifyDigestApp() {
                             items = items,
                             onEnable = {
                                 context.startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
-                            },
-                            onRefresh = {
-                                refreshPermissionState(showPromptWhenMissing = true)
                             }
                         )
                     }
@@ -1141,8 +1183,7 @@ private fun HeroCard(
     hasAccess: Boolean,
     dailyStats: DailyStats,
     items: List<DigestItem>,
-    onEnable: () -> Unit,
-    onRefresh: () -> Unit
+    onEnable: () -> Unit
 ) {
     var showPermissionTooltip by remember(hasAccess) { mutableStateOf(!hasAccess) }
     var infoDialog by remember { mutableStateOf<StatInfo?>(null) }
@@ -1170,7 +1211,7 @@ private fun HeroCard(
         dailyStats.totalCount < dailyStats.yesterdayTotalCount -> "${dailyStats.yesterdayTotalCount - dailyStats.totalCount} fewer alerts than yesterday."
         else -> "Same alert load as yesterday."
     }
-    val roast = when {
+    val statusLine = when {
         dailyStats.totalCount == 0 -> "Quiet phone. Suspiciously peaceful."
         dailyStats.noiseCount == 0 -> "Clean day so far. Your notifications are behaving."
         noiseScore >= 50 -> "Your phone is doing a lot of shouting today."
@@ -1180,20 +1221,33 @@ private fun HeroCard(
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .clip(RoundedCornerShape(24.dp))
-                .background(Brush.linearGradient(listOf(Color.White, Color(0xFFFFF7EE))))
-                .border(1.dp, Line, RoundedCornerShape(24.dp))
-                .padding(14.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp)
+                .clip(RoundedCornerShape(22.dp))
+                .background(Brush.linearGradient(listOf(Color.White, Color(0xFFFFFAF5))))
+                .border(1.dp, Line.copy(alpha = 0.85f), RoundedCornerShape(22.dp))
+                .padding(horizontal = 13.dp, vertical = 12.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
             Row(
                 verticalAlignment = Alignment.Top,
                 horizontalArrangement = Arrangement.spacedBy(10.dp)
             ) {
-                MonsterEatingNotifications(modifier = Modifier.size(48.dp))
-                Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                    Text("Feed me notifications", color = Ink, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Black, maxLines = 2)
-                    Text("Daily Notification Digest", color = Muted, style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.Bold, maxLines = 1)
+                Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                    Text(
+                        statusLine,
+                        color = Ink,
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.Black,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    Text(
+                        if (dailyStats.topAppName.isNotBlank()) topAppLine else comparisonLine,
+                        color = Muted,
+                        style = MaterialTheme.typography.labelMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis
+                    )
                 }
                 if (!hasAccess) {
                     val enableWithHaptic = hapticAction(onEnable)
@@ -1202,11 +1256,8 @@ private fun HeroCard(
                         colors = ButtonDefaults.buttonColors(containerColor = Orange, contentColor = Color.White),
                         shape = RoundedCornerShape(14.dp)
                     ) { Text("Enable", fontWeight = FontWeight.Black) }
-                } else {
-                    RefreshIconButton(onClick = onRefresh)
                 }
             }
-            Text(roast, color = Muted, style = MaterialTheme.typography.bodyMedium, maxLines = 2)
             Row(
                 modifier = Modifier.horizontalScroll(rememberScrollState()),
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -1224,8 +1275,16 @@ private fun HeroCard(
                     infoDialog = StatInfo.Noisy
                 }
             }
-            Text(comparisonLine, color = Ink, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Black, maxLines = 2)
-            Text(topAppLine, color = Ink.copy(alpha = 0.78f), style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold, maxLines = 2)
+            if (dailyStats.topAppName.isNotBlank()) {
+                Text(
+                    comparisonLine,
+                    color = Ink.copy(alpha = 0.74f),
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = FontWeight.Bold,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
         }
         if (!hasAccess && showPermissionTooltip) {
             PermissionTooltip(
@@ -1242,37 +1301,6 @@ private fun HeroCard(
             items = items,
             onDismiss = { infoDialog = null }
         )
-    }
-}
-
-@Composable
-private fun RefreshIconButton(onClick: () -> Unit) {
-    Box(
-        modifier = Modifier
-            .size(44.dp)
-            .clip(CircleShape)
-            .background(Orange)
-            .hapticClick(onClick),
-        contentAlignment = Alignment.Center
-    ) {
-        Canvas(Modifier.size(22.dp)) {
-            drawArc(
-                color = Color.White,
-                startAngle = 35f,
-                sweepAngle = 285f,
-                useCenter = false,
-                topLeft = Offset(size.width * 0.12f, size.height * 0.12f),
-                size = Size(size.width * 0.76f, size.height * 0.76f),
-                style = Stroke(width = size.width * 0.13f, cap = StrokeCap.Round)
-            )
-            val arrow = Path().apply {
-                moveTo(size.width * 0.86f, size.height * 0.10f)
-                lineTo(size.width * 0.98f, size.height * 0.38f)
-                lineTo(size.width * 0.68f, size.height * 0.32f)
-                close()
-            }
-            drawPath(arrow, Color.White)
-        }
     }
 }
 
@@ -1653,7 +1681,10 @@ private fun NotificationDetailDialog(
     onClear: () -> Unit
 ) {
     val context = LocalContext.current
-    val canOpenApp = remember(item.packageName) { hasLaunchableSourceApp(context, item) }
+    val canOpenDestination = remember(item.notificationKey, item.packageName) { hasOpenDestination(context, item) }
+    val openLabel = remember(item.notificationKey) {
+        if (shouldOpenAppDirectly(item) || !DigestNotificationListener.hasContentIntent(item.notificationKey)) "Open app" else "Open notification"
+    }
     val openWithHaptic = hapticAction(onOpen)
     val clearWithHaptic = hapticAction(onClear)
     val dismissWithHaptic = hapticAction(onDismiss)
@@ -1700,12 +1731,12 @@ private fun NotificationDetailDialog(
             }
         },
         confirmButton = {
-            if (canOpenApp) {
+            if (canOpenDestination) {
                 Button(
                     onClick = openWithHaptic,
                     colors = ButtonDefaults.buttonColors(containerColor = Orange, contentColor = Color.White),
                     shape = RoundedCornerShape(14.dp)
-                ) { Text("Open app", fontWeight = FontWeight.Black) }
+                ) { Text(openLabel, fontWeight = FontWeight.Black) }
             }
         },
         dismissButton = {
@@ -1727,81 +1758,178 @@ private fun NotificationCard(
     onDismiss: () -> Unit
 ) {
     val context = LocalContext.current
-    val canOpenApp = remember(item.packageName) { hasLaunchableSourceApp(context, item) }
+    val canOpenDestination = remember(item.notificationKey, item.packageName) { hasOpenDestination(context, item) }
+    val openLabel = remember(item.notificationKey) {
+        if (shouldOpenAppDirectly(item) || !DigestNotificationListener.hasContentIntent(item.notificationKey)) "Open app" else "Open notification"
+    }
     val accent = categoryAccent(item.category)
     val displayLines = remember(item.lines, item.text) { displayNotificationLines(item) }
     val previewLine = displayLines.firstOrNull() ?: item.text
     val toggleExpanded = {
         onToggleExpanded()
     }
-    Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(26.dp))
-            .background(Color.White)
-            .border(1.dp, Line, RoundedCornerShape(26.dp))
-            .hapticClick(onClick = toggleExpanded)
-            .padding(16.dp),
-        verticalArrangement = Arrangement.spacedBy(10.dp)
-    ) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            NotificationSourceIcon(item = item, modifier = Modifier.size(42.dp), accent = accent)
-            Spacer(Modifier.width(10.dp))
-            Column(Modifier.weight(1f)) {
-                Text(
-                    item.title,
-                    color = Ink,
-                    fontWeight = FontWeight.Black,
-                    style = MaterialTheme.typography.titleMedium,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
-                Text(
-                    "${item.appName} - ${formatTime(item.timeMillis)}",
-                    color = Muted,
-                    style = MaterialTheme.typography.labelMedium,
-                    fontWeight = FontWeight.SemiBold
-                )
-            }
-            Spacer(Modifier.width(8.dp))
-            ExpandCollapseButton(expanded = expanded, onClick = toggleExpanded)
-        }
-        if (expanded) {
-            Column(
-                modifier = Modifier.hapticClick(onClick = onClick),
-                verticalArrangement = Arrangement.spacedBy(6.dp)
-            ) {
-                displayLines.forEach { line ->
-                    SenderMessageLine(line)
-                }
-            }
-            NotificationContentImage(
-                path = item.contentImagePath,
-                modifier = Modifier
-                    .height(150.dp)
-                    .hapticClick(onClick = onClick)
-            )
-            CategoryPill(item.category)
-            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                if (canOpenApp) {
-                    SmallAction("Open app", Orange, onOpen)
-                }
-                SmallAction("Clear", Ink, onDismiss)
-            }
-        } else {
-            if (previewLine.isNotBlank()) {
-                Row(
-                    verticalAlignment = Alignment.Top,
-                    horizontalArrangement = Arrangement.spacedBy(10.dp)
-                ) {
-                    Box(Modifier.weight(1f)) {
-                        SenderMessageLine(previewLine, maxLines = 2, compact = true)
+    val haptic = LocalHapticFeedback.current
+    val view = LocalView.current
+    val scope = rememberCoroutineScope()
+    var clearInProgress by remember(item.id) { mutableStateOf(false) }
+    var swipeStartedHapticPlayed by remember(item.id) { mutableStateOf(false) }
+    var clearReadyHapticPlayed by remember(item.id) { mutableStateOf(false) }
+    val dismissState = rememberSwipeToDismissBoxState(
+        confirmValueChange = { value ->
+            when (value) {
+                SwipeToDismissBoxValue.StartToEnd, SwipeToDismissBoxValue.EndToStart -> {
+                    if (!clearInProgress) {
+                        clearInProgress = true
+                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                        view.playSoundEffect(SoundEffectConstants.CLICK)
+                        scope.launch {
+                            delay(260)
+                            onDismiss()
+                        }
                     }
-                    PriorityTag(item.priority)
+                    false
+                }
+                SwipeToDismissBoxValue.Settled -> false
+            }
+        },
+        positionalThreshold = { distance -> distance * 0.50f }
+    )
+    val swipeDirection = dismissState.dismissDirection
+    val swipeProgressTarget = if (swipeDirection == SwipeToDismissBoxValue.Settled) {
+        0f
+    } else {
+        dismissState.progress.coerceIn(0.18f, 1f)
+    }
+    val swipeProgress by animateFloatAsState(
+        targetValue = swipeProgressTarget,
+        animationSpec = tween(durationMillis = 180, easing = FastOutSlowInEasing),
+        label = "swipe-card-progress"
+    )
+    LaunchedEffect(swipeDirection) {
+        if (swipeDirection == SwipeToDismissBoxValue.Settled) {
+            swipeStartedHapticPlayed = false
+            clearReadyHapticPlayed = false
+        } else if (!swipeStartedHapticPlayed) {
+            swipeStartedHapticPlayed = true
+            haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+        }
+    }
+    LaunchedEffect(swipeProgress, swipeDirection) {
+        if (swipeDirection != SwipeToDismissBoxValue.Settled && swipeProgress >= 0.82f && !clearReadyHapticPlayed) {
+            clearReadyHapticPlayed = true
+            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+        }
+    }
+    SwipeToDismissBox(
+        state = dismissState,
+        enableDismissFromStartToEnd = true,
+        enableDismissFromEndToStart = true,
+        backgroundContent = {
+            SwipeActionBackground(direction = swipeDirection)
+        }
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(26.dp))
+                .background(Color.White)
+                .border(1.dp, Line, RoundedCornerShape(26.dp))
+                .hapticClick(onClick = toggleExpanded)
+                .padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                NotificationSourceIcon(item = item, modifier = Modifier.size(42.dp), accent = accent)
+                Spacer(Modifier.width(10.dp))
+                Column(Modifier.weight(1f)) {
+                    Text(
+                        item.title,
+                        color = Ink,
+                        fontWeight = FontWeight.Black,
+                        style = MaterialTheme.typography.titleMedium,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    Text(
+                        "${item.appName} - ${formatTime(item.timeMillis)}",
+                        color = Muted,
+                        style = MaterialTheme.typography.labelMedium,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
+                Spacer(Modifier.width(8.dp))
+                ExpandCollapseButton(expanded = expanded, onClick = toggleExpanded)
+            }
+            if (expanded) {
+                Column(
+                    modifier = Modifier.hapticClick(onClick = onClick),
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    displayLines.forEach { line ->
+                        SenderMessageLine(line)
+                    }
+                }
+                NotificationContentImage(
+                    path = item.contentImagePath,
+                    modifier = Modifier
+                        .height(150.dp)
+                        .hapticClick(onClick = onClick)
+                )
+                CategoryPill(item.category)
+                Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                    if (canOpenDestination) {
+                        SmallAction(openLabel, Orange, onOpen)
+                    }
+                    SmallAction("Clear", Ink, onDismiss)
+                }
+            } else {
+                if (previewLine.isNotBlank()) {
+                    Row(
+                        verticalAlignment = Alignment.Top,
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        Box(Modifier.weight(1f)) {
+                            SenderMessageLine(previewLine, maxLines = 2, compact = true)
+                        }
+                        PriorityTag(item.priority)
+                    }
                 }
             }
         }
     }
+}
+
+@Composable
+private fun SwipeActionBackground(
+    direction: SwipeToDismissBoxValue
+) {
+    val isStartToEnd = direction == SwipeToDismissBoxValue.StartToEnd
+    val isClearing = direction == SwipeToDismissBoxValue.EndToStart
+    val isActive = isStartToEnd || isClearing
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .clip(RoundedCornerShape(26.dp))
+            .background(if (isActive) Red else Color.Transparent)
+            .padding(horizontal = 22.dp),
+        contentAlignment = if (isClearing) Alignment.CenterEnd else Alignment.CenterStart
+    ) {
+        if (isActive) {
+            SwipeActionLabel(label = "Clear")
+        }
+    }
+}
+
+@Composable
+private fun SwipeActionLabel(label: String) {
+    Text(
+        label,
+        color = Color.White,
+        fontWeight = FontWeight.Black,
+        style = MaterialTheme.typography.labelLarge,
+        maxLines = 1,
+        overflow = TextOverflow.Ellipsis
+    )
 }
 
 @Composable
@@ -2156,12 +2284,39 @@ private fun hasLaunchableSourceApp(context: Context, item: DigestItem): Boolean 
         context.packageManager.getLaunchIntentForPackage(item.packageName) != null
 }
 
+private fun hasOpenDestination(context: Context, item: DigestItem): Boolean {
+    return DigestNotificationListener.hasContentIntent(item.notificationKey) || hasLaunchableSourceApp(context, item)
+}
+
+private fun shouldOpenAppDirectly(item: DigestItem): Boolean {
+    val packageName = item.packageName.lowercase()
+    val appName = item.appName.lowercase()
+    return appName == "messages" ||
+        packageName.contains("messaging") ||
+        packageName == "com.google.android.apps.messaging" ||
+        packageName == "com.samsung.android.messaging"
+}
+
 private fun openSourceApp(context: Context, item: DigestItem) {
-    DigestNotificationListener.cancelNotificationFromShade(item.notificationKey)
+    if (!shouldOpenAppDirectly(item) && DigestNotificationListener.sendContentIntent(item.notificationKey)) {
+        Handler(Looper.getMainLooper()).postDelayed({
+            if (AppForegroundState.isForeground) {
+                launchSourceApp(context, item)
+            }
+        }, 450L)
+        return
+    }
+
+    launchSourceApp(context, item)
+}
+
+private fun launchSourceApp(context: Context, item: DigestItem) {
     val intent = context.packageManager.getLaunchIntentForPackage(item.packageName)
     if (intent == null) {
         Toast.makeText(context, "Source app is not installed", Toast.LENGTH_SHORT).show()
     } else {
+        DigestNotificationListener.cancelNotificationFromShade(item.notificationKey)
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         context.startActivity(intent)
     }
 }
